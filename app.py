@@ -25,22 +25,19 @@ log = logging.getLogger("app")
 # --------- ENV ---------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+APP_BASE_URL = os.getenv("APP_BASE_URL", "").strip().rstrip("/")
 
 if not BOT_TOKEN:
     log.warning("ENV BOT_TOKEN is empty!")
 if not OPENAI_API_KEY:
     log.warning("ENV OPENAI_API_KEY is empty! Bot will use fallback replies.")
-
-# Public URL на Render доступен как RENDER_EXTERNAL_URL
-PUBLIC_URL = (os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
-if not PUBLIC_URL:
-    # не критично: вебхук можно выставить вручную; просто логируем
-    log.warning("PUBLIC_URL/RENDER_EXTERNAL_URL is not set. Webhook auto-set will be skipped.")
+if not APP_BASE_URL:
+    log.warning("APP_BASE_URL is empty! Webhook auto-set will be skipped.")
 
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
-WEBHOOK_URL = f"{PUBLIC_URL}{WEBHOOK_PATH}" if PUBLIC_URL else None
+WEBHOOK_URL = f"{APP_BASE_URL}{WEBHOOK_PATH}" if APP_BASE_URL else None
 
-# --------- OpenAI client (v1.x) ---------
+# --------- OpenAI client ---------
 reply_fallback = "Эх, давай просто выпьем за всё хорошее! 🥃"
 
 client = None
@@ -55,10 +52,6 @@ if OPENAI_API_KEY:
 
 
 async def generate_reply(prompt: str) -> str:
-    """
-    Вызов OpenAI (с ограничениями) с падением в фолбэк.
-    Используем поток, т.к. SDK синхронный.
-    """
     if not client:
         return reply_fallback
 
@@ -68,7 +61,6 @@ async def generate_reply(prompt: str) -> str:
     )
 
     def _call():
-        # Используем Chat Completions для стабильности
         return client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
@@ -81,8 +73,7 @@ async def generate_reply(prompt: str) -> str:
 
     try:
         resp = await asyncio.to_thread(_call)
-        text = resp.choices[0].message.content.strip()
-        return text or reply_fallback
+        return resp.choices[0].message.content.strip() or reply_fallback
     except Exception as e:
         log.error(f"OpenAI error: {e}")
         return reply_fallback
@@ -117,11 +108,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --------- FastAPI + PTB lifecycle ---------
 app = FastAPI()
 
-# Создаем Telegram Application (без polling)
 application: Optional[Application] = None
 if BOT_TOKEN:
     application = Application.builder().token(BOT_TOKEN).build()
-    # Регистрируем хэндлеры сразу
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("toast", cmd_toast))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
@@ -141,15 +130,12 @@ async def _startup():
     log.info("Starting Telegram application...")
     await application.initialize()
     await application.start()
-    # Вебхук выставляем автоматически, если известен публичный URL
     if WEBHOOK_URL:
         try:
             await application.bot.set_webhook(WEBHOOK_URL, allowed_updates=["message"])
             log.info(f"Webhook set to: {WEBHOOK_URL}")
         except Exception as e:
             log.error(f"Failed to set webhook: {e}")
-    else:
-        log.warning("Webhook auto-set skipped (no PUBLIC_URL/RENDER_EXTERNAL_URL).")
 
 
 @app.on_event("shutdown")
@@ -160,13 +146,8 @@ async def _shutdown():
     await application.shutdown()
 
 
-# Telegram webhook endpoint — ДОЛЖЕН совпадать с setWebhook
 @app.post(WEBHOOK_PATH if BOT_TOKEN else "/webhook-not-configured")
 async def telegram_webhook(request: Request):
-    """
-    Telegram шлет апдейты сюда. Мы передаем их в PTB.
-    Возвращаем 200 OK всегда, чтобы Telegram не ретраил.
-    """
     try:
         data = await request.json()
         log.info(f"Incoming update: {data}")
@@ -174,10 +155,8 @@ async def telegram_webhook(request: Request):
             return JSONResponse({"ok": True})
 
         update = Update.de_json(data, application.bot)
-        # передаём апдейт в PTB
         await application.process_update(update)
         return JSONResponse({"ok": True})
     except Exception as e:
         log.error(f"webhook error: {e}")
-        # отвечаем 200, но текстом — чтобы Telegram не считал это ошибкой
         return PlainTextResponse("ok")
