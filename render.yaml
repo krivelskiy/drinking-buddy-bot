@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: drinking-buddy-bot
+    env: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn app:app --host 0.0.0.0 --port 10000"
+    plan: free
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: APP_BASE_URL
+        sync: false
+    autoDeploy: true
+    healthCheckPath: "/"
+    region: frankfurt
