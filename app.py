@@ -1,5 +1,7 @@
 import os
 import logging
+from typing import Optional
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
@@ -25,7 +27,7 @@ logger = logging.getLogger("app")
 # ---------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-APP_BASE_URL = os.getenv("APP_BASE_URL")  # например: https://drinking-buddy-bot.onrender.com
+APP_BASE_URL = os.getenv("APP_BASE_URL")  # напр. https://drinking-buddy-bot.onrender.com
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./memory.db")
 
 if not BOT_TOKEN:
@@ -33,24 +35,22 @@ if not BOT_TOKEN:
 if not OPENAI_API_KEY:
     logger.error("❌ OPENAI_API_KEY is missing")
 if not APP_BASE_URL:
-    logger.warning("⚠️ APP_BASE_URL is missing (авто-установка вебхука будет невозможна)")
+    logger.warning("⚠️ APP_BASE_URL is missing (авто-установка вебхука будет пропущена)")
 
 # ---------------------------
 # OpenAI
 # ---------------------------
+client: Optional[OpenAI] = None
 try:
     client = OpenAI(api_key=OPENAI_API_KEY)
     logger.info("✅ OpenAI client initialized")
 except Exception as e:
-    client = None
     logger.exception("❌ OpenAI init failed: %s", e)
 
 # ---------------------------
 # БАЗА (SQLAlchemy)
 # ---------------------------
 Base = declarative_base()
-# Для sqlite оставляем sync engine; для Postgres указывай DATABASE_URL вида:
-# postgres://user:pass@host:port/dbname  (или postgresql://...)
 engine = create_engine(DATABASE_URL, echo=False, future=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
@@ -85,7 +85,9 @@ STICKERS = {
     "веселье": "CAACAgIAAxkBAAEBjrpouGAERwa1uHIJiB5lkhQZps-j_wACcoEAAlGlwEnCOTC-IwMCBDYE",
 }
 
-
+# ---------------------------
+# Хелперы памяти
+# ---------------------------
 def _save_history(session, user_id: int, user_name: str, user_text: str, bot_text: str | None = None):
     mem = session.query(UserMemory).filter_by(user_id=user_id).first()
     if not mem:
@@ -102,13 +104,15 @@ def _save_history(session, user_id: int, user_name: str, user_text: str, bot_tex
 
 def _maybe_extract_favorite_drink(mem: UserMemory, text: str) -> None:
     low = text.lower()
-    # простая эвристика
     if "любим" in low:
         for drink in ("пиво", "вино", "водка", "виски"):
             if drink in low:
                 mem.favorite_drink = drink
 
 
+# ---------------------------
+# Хендлеры
+# ---------------------------
 async def start(update: Update, context):
     try:
         text = "Привет! Я Катя. А как тебя зовут и что ты сегодня хочешь выпить?"
@@ -141,12 +145,11 @@ async def handle_message(update: Update, context):
         _maybe_extract_favorite_drink(mem, user_text)
         session.commit()
 
-        # Ответ от модели
+        # Ответ от модели (или fallback)
         try:
             if client is None:
                 raise RuntimeError("OpenAI client not initialized")
 
-            # Берём немного контекста (последние 10 фраз)
             short_history = (mem.history or "").splitlines()[-20:]
             system_prompt = (
                 "Ты — Катя, собутыльница. Женский тон, лёгкий флирт (уместно), юмор, "
@@ -172,14 +175,13 @@ async def handle_message(update: Update, context):
     finally:
         session.close()
 
-    # Ответ пользователю
     try:
         await context.bot.send_message(chat_id=chat_id, text=response_text)
     except Exception:
         logger.exception("Failed to send message to chat %s", chat_id)
 
 
-# Регистрируем хендлеры
+# Регистрация хендлеров
 tapp.add_handler(CommandHandler("start", start))
 tapp.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
@@ -188,20 +190,52 @@ tapp.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
 # ---------------------------
 app = FastAPI()
 
+@app.on_event("startup")
+async def _startup():
+    """
+    ВАЖНО: для ручной обработки вебхуков через FastAPI нужно явно инициализировать PTB Application.
+    """
+    try:
+        await tapp.initialize()
+        logger.info("✅ PTB Application initialized")
+    except Exception:
+        logger.exception("❌ PTB Application initialize failed")
+
+    # Ставим вебхук, если есть базовый URL
+    if APP_BASE_URL:
+        try:
+            wh_url = f"{APP_BASE_URL}/webhook/{BOT_TOKEN}"
+            await tapp.bot.set_webhook(url=wh_url, allowed_updates=["message"])
+            logger.info("✅ Webhook set to %s", wh_url)
+        except Exception:
+            logger.exception("❌ set_webhook failed")
+
+
+@app.on_event("shutdown")
+async def _shutdown():
+    try:
+        await tapp.shutdown()
+        logger.info("✅ PTB Application shutdown")
+    except Exception:
+        logger.exception("❌ PTB Application shutdown failed")
+
 
 @app.post("/webhook/{token}")
 async def telegram_webhook(token: str, request: Request):
-    # Токен в URL должен совпадать с BOT_TOKEN
     if token != BOT_TOKEN:
         logger.warning("Webhook hit with wrong token")
         return JSONResponse(status_code=403, content={"ok": False, "error": "Forbidden"})
 
     try:
         data = await request.json()
-        # 🔧 ВАЖНО: В PTB v20 нужен bot вторым аргументом!
-        update = Update.de_json(data, tapp.bot)
+        update = Update.de_json(data, tapp.bot)  # PTB v20: обязателен bot вторым аргументом
         logger.info("Incoming update_id=%s", getattr(update, "update_id", "n/a"))
-        await tapp.process_update(update)
+        try:
+            await tapp.process_update(update)  # требует .initialize() (см. startup)
+        except Exception as e:
+            logger.exception("process_update failed")
+            # Не шлём ответ в чат из вебхука (чтобы не зациклить/заспамить), просто 500 → Telegram перешлёт повтор
+            return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
         return JSONResponse(content={"ok": True})
     except Exception as e:
         logger.exception("Webhook error: %s", e)
@@ -211,4 +245,3 @@ async def telegram_webhook(token: str, request: Request):
 @app.get("/")
 async def health():
     return {"status": "ok"}
-
