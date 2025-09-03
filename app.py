@@ -1,423 +1,164 @@
 import os
 import re
-import json
 import logging
-from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Tuple
 
-import httpx
-from fastapi import FastAPI, Request, Response, status
-from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse, PlainTextResponse
 
-# --- ЛОГИ ---
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
+from telegram import Update
+from telegram.ext import Application, ApplicationBuilder, ContextTypes
+from telegram.ext import CommandHandler, MessageHandler, filters
+
+# === ТВОИ существующие импорты (OpenAI, SQLAlchemy, модели, и т.д.) остаются ===
+# from openai import OpenAI
+# ... и все, что уже было у тебя выше/ниже, не трогаем
+
+logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("app")
 
-# --- ENV ---
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-APP_BASE_URL = os.getenv("APP_BASE_URL")
-DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL") or os.getenv("POSTGRESQL_URL")
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+APP_BASE_URL = os.environ["APP_BASE_URL"]  # уже есть у тебя
 
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else None
+app = FastAPI(title="drinking-buddy-bot")
 
-OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+# ---------------------------
+# 1) Маппинг file_id стикеров
+# ---------------------------
+DRINK_STICKERS = {
+    # напитки
+    "beer": "CAACAgIAAxkBAAEBjsRouGBy8fdkWj0MhodvqLl3eT9fcgACX4cAAvmhwElmpyDuoHw7IjYE",
+    "wine": "CAACAgIAAxkBAAEBjsJouGBk6eEZ60zhrlVYxtaa6o1IpwACzoEAApg_wUm0xElTR8mU3zYE",
+    "whisky": "CAACAgIAAxkBAAEBjsBouGBSGJX2UPfsKzHTIYlfD7eAswACDH8AAnEbyEnqwlOYBHZL3jYE",
+    "vodka": "CAACAgIAAxkBAAEBjr5ouGBBx_1-DTY7HwkdW3rQWOcgRAACsIAAAiFbyEn_G4lgoMu7IjYE",
+    # эмоции (на всякий случай — можно использовать дальше)
+    "happy": "CAACAgIAAxkBAAEBjrpouGAERwa1uHIJiB5lkhQZps-j_wACcoEAAlGlwEnCOTC-IwMCBDYE",
+    "sad":   "CAACAgIAAxkBAAEBjrxouGAyqkcwuIJiCaINHEu-QVn4NAAC1IAAAhynyUnZmmKvP768xzYE",
+}
 
-FALLBACK_REPLY = "Эх, давай просто выпьем за всё хорошее! 🥃"
-DB_DOWN_REPLY = os.getenv(
-    "DB_DOWN_REPLY",
-    "Сегодня я без своей долгой памяти — давай просто выпьем за хорошее настроение! 🥂"
-)
+# Ключевые слова на RU/EN для классов напитков
+DRINK_KEYWORDS = {
+    "beer": [
+        r"\bпиво\b", r"\bпивко\b", r"\bлагер\b", r"\bэ(й|i)ль\b", r"\bstout\b", r"\bipa\b",
+        r"\bbeer\b", r"\bpilsner\b", r"\bбарнаульск(ое|ий)\b"
+    ],
+    "wine": [
+        r"\bвино\b", r"\bкрасное\b вино", r"\bбелое\b вино", r"\bроз(е|э)\b", r"\bwine\b", r"\bшардоне\b", r"\бмерло\b"
+    ],
+    "whisky": [
+        r"\bвис(ки|кии)\b", r"\bскотч\b", r"\bбурбон\b", r"\bwhisk(e?)y\b"
+    ],
+    "vodka": [
+        r"\bводк[аи]\b", r"\bvodka\b", r"\bстопк(а|у|и)\b"
+    ],
+    # При желании легко добавить "champagne", "rum", "gin" и т.д.
+}
 
-# --- СИСТЕМНЫЕ ПРАВИЛА ДЛЯ КАТИ ---
-SYSTEM_PROMPT_BASE = (
-    "Ты Катя — лёгкая, тёплая собеседница и собутыльница. "
-    "Флиртуешь уместно, шутишь, поддерживаешь как психолог, ведёшь диалог непринуждённо. "
-    "Ты помнишь имя и любимые напитки собеседника и подстраиваешься под них. "
-    "Очень важно: не начинай ответы со стандартных приветствий и не обращайся по имени каждый раз, "
-    "если разговор уже идёт. Отвечай по делу, естественно и короткими абзацами. "
-    "Если пользователь спрашивает о своём любимом напитке — используй сохранённую память. "
-    "Если просит тост — дай тёплый, небанальный тост. Всегда старайся завершать реплику вопросом, "
-    "чтобы поддержать беседу."
-)
+# 2) Функция детекции напитка
+def detect_drink(text: str) -> Optional[Tuple[str, str]]:
+    """Возвращает ('beer'|'wine'|'whisky'|'vodka', matched_word) либо None."""
+    t = text.lower()
+    for drink, patterns in DRINK_KEYWORDS.items():
+        for pat in patterns:
+            if re.search(pat, t):
+                return drink, pat
+    return None
 
-# --- АВАРИЙНАЯ RAM-ПАМЯТЬ (если БД недоступна) ---
-RAM: Dict[int, Dict[str, Any]] = {}
+# === Ниже оставь твои текущие объекты БД, OpenAI-клиент, prepare_prompt и т.п. ===
+# client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+# SessionLocal, Base, User, Message ... и т.д.
 
-# --- DB (SQLAlchemy sync) ---
-DB_AVAILABLE = False
-DB_PROBE_ERROR = None
+# ---------------------------
+# 3) Telegram application
+# ---------------------------
+tapp: Application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-def db_init() -> bool:
-    """Создаёт таблицы при необходимости. Возвращает True, если БД доступна."""
-    global DB_PROBE_ERROR
-    if not DATABASE_URL:
-        DB_PROBE_ERROR = "DATABASE_URL not set"
-        return False
-    try:
-        import psycopg2  # type: ignore
-        conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
-        cur = conn.cursor()
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            chat_id BIGINT PRIMARY KEY,
-            name TEXT,
-            favorite_drinks JSONB DEFAULT '[]'::jsonb,
-            summary TEXT,
-            created_at TIMESTAMPTZ DEFAULT now(),
-            updated_at TIMESTAMPTZ DEFAULT now()
-        );
-        """)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id BIGSERIAL PRIMARY KEY,
-            chat_id BIGINT NOT NULL,
-            role TEXT NOT NULL,          -- 'user' | 'assistant'
-            content TEXT NOT NULL,
-            created_at TIMESTAMPTZ DEFAULT now()
-        );
-        """)
-        conn.commit()
-        cur.close()
-        conn.close()
-        return True
-    except Exception as e:
-        DB_PROBE_ERROR = f"init error: {e}"
-        return False
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Привет! Я Катя. А как тебя зовут и что ты сегодня хочешь выпить?")
 
-def db_get_user(chat_id: int) -> Dict[str, Any]:
-    try:
-        import psycopg2, psycopg2.extras  # type: ignore
-        conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT chat_id, name, favorite_drinks, summary FROM users WHERE chat_id=%s;", (chat_id,))
-        row = cur.fetchone()
-        if not row:
-            cur.execute(
-                "INSERT INTO users(chat_id) VALUES(%s) ON CONFLICT DO NOTHING;",
-                (chat_id,)
-            )
-            conn.commit()
-            row = {"chat_id": chat_id, "name": None, "favorite_drinks": [], "summary": None}
-        else:
-            if row.get("favorite_drinks") is None:
-                row["favorite_drinks"] = []
-        cur.close()
-        conn.close()
-        return row
-    except Exception as e:
-        log.exception("db_get_user error: %s", e)
-        return {"chat_id": chat_id, "name": None, "favorite_drinks": [], "summary": None}
+async def toast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("За всё хорошее! 🥂")
 
-def db_update_user(chat_id: int, name: Optional[str] = None, add_drinks: Optional[List[str]] = None):
-    try:
-        import psycopg2, psycopg2.extras  # type: ignore
-        conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
-        cur = conn.cursor()
-        if name is not None:
-            cur.execute("UPDATE users SET name=%s, updated_at=now() WHERE chat_id=%s;", (name, chat_id))
-        if add_drinks:
-            # аккуратно мёржим список
-            cur.execute("SELECT favorite_drinks FROM users WHERE chat_id=%s;", (chat_id,))
-            row = cur.fetchone()
-            cur_drinks = row[0] if row and row[0] else []
-            merged = list(dict.fromkeys([*cur_drinks, *add_drinks]))
-            cur.execute(
-                "UPDATE users SET favorite_drinks=%s, updated_at=now() WHERE chat_id=%s;",
-                (json.dumps(merged, ensure_ascii=False), chat_id),
-            )
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        log.exception("db_update_user error: %s", e)
+# Главное: обработчик обычного текста
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
 
-def db_save_message(chat_id: int, role: str, content: str):
-    try:
-        import psycopg2  # type: ignore
-        conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO messages(chat_id, role, content) VALUES (%s, %s, %s);",
-            (chat_id, role, content),
-        )
-        # оставляем последние 50 сообщений
-        cur.execute("""
-            DELETE FROM messages
-            WHERE chat_id=%s AND id NOT IN (
-                SELECT id FROM messages WHERE chat_id=%s ORDER BY id DESC LIMIT 50
-            );
-        """, (chat_id, chat_id))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        log.exception("db_save_message error: %s", e)
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    text_in = update.message.text
 
-def db_get_recent_dialogue(chat_id: int, limit_pairs: int = 8) -> List[Tuple[str, str]]:
-    """Возвращает последние пары (user, assistant) как список пар строк.
-       Если последовательность не парная, берём последние сообщения по порядку."""
-    try:
-        import psycopg2, psycopg2.extras  # type: ignore
-        conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("""
-            SELECT role, content
-            FROM messages
-            WHERE chat_id=%s
-            ORDER BY id DESC
-            LIMIT %s;
-        """, (chat_id, limit_pairs * 2))
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-        rows = list(reversed(rows))
-        # возьмём только последние сообщения (user/assistant) без строгой парности
-        return [(r["role"], r["content"]) for r in rows]
-    except Exception as e:
-        log.exception("db_get_recent_dialogue error: %s", e)
-        return []
-
-# --- TG + OpenAI ---
-async def tg_send_message(chat_id: int, text: str) -> Optional[dict]:
-    if not TELEGRAM_API:
-        log.error("❌ TELEGRAM_API not configured")
-        return None
-    try:
-        async with httpx.AsyncClient(timeout=12) as client:
-            r = await client.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text})
-            log.info("TG sendMessage %s %s", r.status_code, r.text[:400])
-            return r.json()
-    except Exception as e:
-        log.exception("TG sendMessage error: %s", e)
-        return None
-
-def _extract_drinks_freeform(text: str) -> List[str]:
-    """Выдёргиваем напитки из произвольных фраз — в т.ч. составные (‘барнаульское чешское’)."""
-    s = text.lower()
-    # если встречается "мой любимый", "любимый сорт/напиток" — берём всё после тире/двоеточия/слова "—/ - /: "
-    m = re.search(r"(любим(ый|ое|ая).{0,20}?(сорт|напиток)[^\wа-яё]+)(.+)$", s)
-    candidates: List[str] = []
-    if m:
-        tail = m.group(4).strip()
-        # отрезаем лишнее после точки/восклиц / вопроса
-        tail = re.split(r"[.?!]", tail)[0].strip()
-        if tail:
-            candidates.append(tail)
-    # словарь популярных напитков (если просто упомянули)
-    vocab = [
-        "вино","пиво","виски","ром","коньяк","текила","водка","шампанское","джин",
-        "негрони","апероль","маргарита","мохито","манхэттен","олд фэшнд","барнаульское чешское"
-    ]
-    for v in vocab:
-        if v in s and v not in candidates:
-            candidates.append(v)
-    # нормализуем пробелы
-    clean = []
-    for c in candidates:
-        c = re.sub(r"\s+", " ", c).strip(" -–—:;,.!?'\"").strip()
-        if c:
-            clean.append(c)
-    # уникализируем с сохранением порядка
-    unique = list(dict.fromkeys(clean))
-    return unique[:5]
-
-async def openai_chat(messages: List[Dict[str, str]]) -> str:
-    if not OPENAI_API_KEY:
-        log.warning("OPENAI_API_KEY absent -> fallback")
-        return FALLBACK_REPLY
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    payload = {"model": OPENAI_MODEL, "messages": messages, "temperature": 0.7, "max_tokens": 380}
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.post(OPENAI_CHAT_URL, headers=headers, json=payload)
-            log.info("OpenAI %s: %s", r.status_code, r.text[:600])
-            if r.status_code == 200:
-                data = r.json()
-                return data["choices"][0]["message"]["content"].strip()
-            log.error("OpenAI error %s: %s", r.status_code, r.text)
-            return FALLBACK_REPLY
-    except Exception as e:
-        log.exception("OpenAI exception: %s", e)
-        return FALLBACK_REPLY
-
-def build_messages_with_memory(chat_id: int, incoming_text: str, user_hint_name: Optional[str]) -> List[Dict[str, str]]:
-    """Собираем системный промпт + недавний контекст из БД (или RAM), + текущий запрос."""
-    # БД/или RAM
-    if DB_AVAILABLE:
-        u = db_get_user(chat_id)
-        name = u.get("name") or user_hint_name
-        drinks = u.get("favorite_drinks") or []
-        summary = u.get("summary") or ""
-        history_rows = db_get_recent_dialogue(chat_id, limit_pairs=8)
+    # 3.1 детектируем напиток заранее (для стикера и для подсказки в промпт)
+    drink_detection = detect_drink(text_in)
+    if drink_detection:
+        drink_key, matched = drink_detection
+        log.info(f"[drink] user={user_id} matched={matched} -> {drink_key}")
     else:
-        mem = RAM.get(chat_id, {})
-        name = mem.get("name") or user_hint_name
-        drinks = mem.get("drinks", [])
-        summary = mem.get("summary", "")
-        history_rows = mem.get("history", [])
+        log.info(f"[drink] user={user_id} matched=None")
 
-    # системный
-    context = f"Имя пользователя: {name or 'не сказал'}. Любимые напитки: "
-    context += (", ".join(drinks) if drinks else "пока не рассказаны") + ". "
-    if summary:
-        context += f"Краткое резюме прошлых диалогов: {summary}."
+    # 3.2 сохраняем вход в БД, подтягиваем память — ТВОЙ текущий код здесь
+    # save_message(user_id, 'user', text_in)  # пример
 
-    sys = f"{SYSTEM_PROMPT_BASE} {context}"
+    # 3.3 генерим ответ Каті (ТВОЙ текущий вызов OpenAI)
+    # reply_text = await generate_reply(user_id, text_in, drink_hint=drink_detection[0] if drink_detection else None)
+    # На случай проблем с OpenAI/БД — безопасный ответ:
+    reply_text = None
+    try:
+        # Замени на твою функцию генерации:
+        # reply_text = await gen_with_openai(user_id, text_in, drink_detection[0] if drink_detection else None)
+        pass
+    except Exception as e:
+        log.exception("OpenAI generation failed")
+    if not reply_text:
+        reply_text = "Давай просто выпьем за всё хорошее! 🥂 Что нальём?"
 
-    messages: List[Dict[str, str]] = [{"role": "system", "content": sys}]
+    # 3.4 шлём текст
+    await context.bot.sendMessage(chat_id=chat_id, text=reply_text)
 
-    # недавняя история
-    if history_rows:
-        # history_rows может быть [("user","..."),("assistant","..."),...]
-        for r in history_rows[-16:]:
-            role, content = (r if isinstance(r, tuple) else (r.get("role"), r.get("content")))
-            if role in ("user", "assistant") and content:
-                messages.append({"role": role, "content": content})
+    # 3.5 если распознали напиток — шлём подходящий стикер
+    if drink_detection:
+        drink_key, _ = drink_detection
+        file_id = DRINK_STICKERS.get(drink_key)
+        if file_id:
+            try:
+                await context.bot.sendSticker(chat_id=chat_id, sticker=file_id)
+                log.info(f"[sticker] sent {drink_key} to user={user_id}")
+            except Exception:
+                log.exception("[sticker] failed to send")
 
-    # текущий запрос
-    messages.append({"role": "user", "content": incoming_text})
-    return messages
+    # 3.6 сохраняем ответ в БД — ТВОЙ текущий код
+    # save_message(user_id, 'assistant', reply_text)
 
-def update_memory(chat_id: int, text: str, reply: str, user_name: Optional[str]):
-    drinks_found = _extract_drinks_freeform(text)
-    if DB_AVAILABLE:
-        if user_name:
-            db_update_user(chat_id, name=user_name)
-        if drinks_found:
-            db_update_user(chat_id, add_drinks=drinks_found)
-        db_save_message(chat_id, "user", text)
-        db_save_message(chat_id, "assistant", reply)
-    else:
-        # RAM fallback
-        mem = RAM.setdefault(chat_id, {"history": [], "drinks": []})
-        if user_name and not mem.get("name"):
-            mem["name"] = user_name
-        if drinks_found:
-            mem["drinks"] = list(dict.fromkeys([*mem["drinks"], *drinks_found]))
-        mem["history"].append(("user", text))
-        mem["history"].append(("assistant", reply))
-        mem["history"] = mem["history"][-20:]
+# Зарегистрируем хендлеры
+tapp.add_handler(CommandHandler("start", start_cmd))
+tapp.add_handler(CommandHandler("toast", toast_cmd))
+tapp.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-# --- FastAPI ---
-app = FastAPI(title="Drinking Buddy Bot")
-
-@app.on_event("startup")
-async def startup():
-    global DB_AVAILABLE
-    # DB
-    DB_AVAILABLE = db_init()
-    if DB_AVAILABLE:
-        log.info("✅ Database initialized and available")
-    else:
-        log.warning("⚠️ Database unavailable: %s", DB_PROBE_ERROR or "unknown")
-
-    # setWebhook
-    if BOT_TOKEN and APP_BASE_URL:
-        hook_url = f"{APP_BASE_URL}/webhook/{BOT_TOKEN}"
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.post(
-                    f"{TELEGRAM_API}/setWebhook",
-                    data={"url": hook_url, "allowed_updates": json.dumps(["message"])}
-                )
-            log.info("✅ Webhook set to %s", hook_url)
-            log.info("TG setWebhook %s %s", r.status_code, r.text)
-        except Exception as e:
-            log.exception("setWebhook error: %s", e)
-
+# ---------------------------
+# 4) FastAPI endpoints
+# ---------------------------
 @app.get("/")
-async def root():
-    return PlainTextResponse("OK", status_code=200)
-
-@app.get("/healthz")
 async def health():
-    return JSONResponse({
-        "ok": True,
-        "db_available": DB_AVAILABLE,
-        "db_reason": DB_PROBE_ERROR,
-        "app_base_url": APP_BASE_URL,
-        "webhook": f"/webhook/{(BOT_TOKEN or 'no-token')[-6:]}"
-    })
+    return PlainTextResponse("OK")
 
 @app.post("/webhook/{token}")
-async def webhook(token: str, request: Request):
-    body = await request.body()
-    text_body = body.decode("utf-8", errors="replace")
-    log.info("Incoming webhook token_ok=%s body=%s", token == (BOT_TOKEN or ""), text_body[:1800])
-
-    if not BOT_TOKEN or token != BOT_TOKEN:
-        log.error("❌ Token mismatch")
-        return Response(status_code=status.HTTP_404_NOT_FOUND)
-
+async def telegram_webhook(token: str, request: Request):
+    if token != BOT_TOKEN:
+        raise HTTPException(status_code=403, detail="forbidden")
+    update = Update.de_json(await request.json(), context=tapp.bot)
     try:
-        update = json.loads(text_body) if text_body else {}
-    except Exception as e:
-        log.exception("JSON parse error: %s", e)
-        return Response(status_code=200)
+        await tapp.initialize()  # важно для корректной обработки апдейта
+        await tapp.process_update(update)
+    except Exception:
+        log.exception("Webhook error")
+    return JSONResponse({"ok": True})
 
-    msg = update.get("message") or {}
-    chat = msg.get("chat") or {}
-    chat_id = chat.get("id")
-    text = msg.get("text") or ""
-    from_user = msg.get("from") or {}
-    first_name = from_user.get("first_name")
-    username = from_user.get("username")
-    name_hint = first_name or username
-
-    if not chat_id:
-        return Response(status_code=200)
-
-    # команды (всегда работают)
-    if text.startswith("/start"):
-        greet = "Привет! Я Катя. А как тебя зовут и что ты сегодня хочешь выпить?"
-        await tg_send_message(chat_id, greet)
-        return Response(status_code=200)
-
-    if text.startswith("/toast"):
-        toast = "За встречу и искренние разговоры — чтобы бокалы пустели, а душа наполнялась! 🥂"
-        await tg_send_message(chat_id, toast)
-        return Response(status_code=200)
-
-    # если БД недоступна — фиксированный ответ
-    if not DB_AVAILABLE:
-        await tg_send_message(chat_id, DB_DOWN_REPLY)
-        return Response(status_code=200)
-
-    # обычный ход: собираем контекст с памятью и спрашиваем ИИ
+# Установка вебхука на старте
+@app.on_event("startup")
+async def on_startup():
+    webhook_url = f"{APP_BASE_URL}/webhook/{BOT_TOKEN}"
     try:
-        messages = build_messages_with_memory(chat_id, text, name_hint)
-        reply = await openai_chat(messages)
-    except Exception as e:
-        log.exception("AI pipeline error: %s", e)
-        reply = FALLBACK_REPLY
-
-    # сохраняем память (имя/напитки/история)
-    try:
-        update_memory(chat_id, text, reply, name_hint)
-    except Exception as e:
-        log.exception("memory update error: %s", e)
-
-    await tg_send_message(chat_id, reply)
-    return Response(status_code=200)
-
-# Диагностика
-@app.get("/debug/webhook-info")
-async def webhook_info():
-    if not TELEGRAM_API:
-        return JSONResponse({"error": "no BOT_TOKEN"}, status_code=500)
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(f"{TELEGRAM_API}/getWebhookInfo")
-        return JSONResponse(r.json())
-    except Exception as e:
-        log.exception("getWebhookInfo error: %s", e)
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-@app.get("/debug/user/{chat_id}")
-async def debug_user(chat_id: int):
-    if DB_AVAILABLE:
-        return JSONResponse(db_get_user(chat_id))
-    return JSONResponse(RAM.get(chat_id, {}))
+        await tapp.bot.set_webhook(webhook_url)
+        log.info(f"✅ Webhook set to {webhook_url}")
+    except Exception:
+        log.exception("Failed to set webhook")
