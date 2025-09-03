@@ -6,12 +6,13 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackContext, ContextTypes, filters
 
 from openai import OpenAI
 
-from sqlalchemy import create_engine, Column, Integer, String, Text
+from sqlalchemy import create_engine, Column, Integer, String, Text, text
 from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy import inspect
 
 # ---------------------------
 # ЛОГИРОВАНИЕ
@@ -64,8 +65,51 @@ class UserMemory(Base):
     history = Column(Text)
 
 
+def ensure_schema():
+    """
+    Безостановочный апгрейд схемы на проде.
+    Добиваемся наличия таблицы и нужных колонок.
+    """
+    try:
+        Base.metadata.create_all(bind=engine)
+        insp = inspect(engine)
+
+        # Убедимся, что таблица существует
+        if not insp.has_table("user_memory"):
+            with engine.begin() as conn:
+                conn.execute(text("""
+                    CREATE TABLE user_memory (
+                        id SERIAL PRIMARY KEY,
+                        user_id INTEGER UNIQUE,
+                        name VARCHAR(100),
+                        favorite_drink VARCHAR(100),
+                        history TEXT
+                    )
+                """))
+                logger.info("ℹ️ Created table user_memory manually")
+
+        # Проверим недостающие колонки
+        cols = {c["name"] for c in insp.get_columns("user_memory")}
+        with engine.begin() as conn:
+            if "favorite_drink" not in cols:
+                conn.execute(text("ALTER TABLE user_memory ADD COLUMN favorite_drink VARCHAR(100)"))
+                logger.info("🔧 Added column user_memory.favorite_drink")
+            if "history" not in cols:
+                conn.execute(text("ALTER TABLE user_memory ADD COLUMN history TEXT"))
+                logger.info("🔧 Added column user_memory.history")
+            if "name" not in cols:
+                conn.execute(text("ALTER TABLE user_memory ADD COLUMN name VARCHAR(100)"))
+                logger.info("🔧 Added column user_memory.name")
+            if "user_id" not in cols:
+                conn.execute(text("ALTER TABLE user_memory ADD COLUMN user_id INTEGER UNIQUE"))
+                logger.info("🔧 Added column user_memory.user_id")
+    except Exception as e:
+        logger.exception("❌ ensure_schema failed: %s", e)
+        raise
+
+
 try:
-    Base.metadata.create_all(bind=engine)
+    ensure_schema()
     logger.info("✅ Database initialized")
 except Exception as e:
     logger.exception("❌ Database init failed: %s", e)
@@ -94,6 +138,7 @@ def _save_history(session, user_id: int, user_name: str, user_text: str, bot_tex
         mem = UserMemory(user_id=user_id, name=user_name, favorite_drink="", history="")
         session.add(mem)
         session.flush()
+    # осторожно: если история NULL в БД
     if user_text:
         mem.history = (mem.history or "") + f"\nUser: {user_text}"
     if bot_text:
@@ -102,18 +147,17 @@ def _save_history(session, user_id: int, user_name: str, user_text: str, bot_tex
     return mem
 
 
-def _maybe_extract_favorite_drink(mem: UserMemory, text: str) -> None:
-    low = text.lower()
+def _maybe_extract_favorite_drink(mem: UserMemory, text_in: str) -> None:
+    low = (text_in or "").lower()
     if "любим" in low:
         for drink in ("пиво", "вино", "водка", "виски"):
             if drink in low:
                 mem.favorite_drink = drink
 
-
 # ---------------------------
 # Хендлеры
 # ---------------------------
-async def start(update: Update, context):
+async def start(update: Update, context: CallbackContext):
     try:
         text = "Привет! Я Катя. А как тебя зовут и что ты сегодня хочешь выпить?"
         await context.bot.send_message(chat_id=update.effective_chat.id, text=text)
@@ -121,15 +165,14 @@ async def start(update: Update, context):
     except Exception:
         logger.exception("Failed to handle /start")
 
-
-async def handle_message(update: Update, context):
+async def handle_message(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
     user = update.effective_user
     user_id = user.id
     user_name = user.first_name
     user_text = update.message.text or ""
 
-    # Стикеры по ключевым словам
+    # Стикеры по ключевым словам (до вызова модели)
     for key, sid in STICKERS.items():
         if key in user_text.lower():
             try:
@@ -138,7 +181,7 @@ async def handle_message(update: Update, context):
             except Exception:
                 logger.exception("Failed sending sticker %s", key)
 
-    # Память
+    # Память и ответ
     session = SessionLocal()
     try:
         mem = _save_history(session, user_id, user_name, user_text)
@@ -159,19 +202,25 @@ async def handle_message(update: Update, context):
             )
             messages = [{"role": "system", "content": system_prompt}]
             for line in short_history:
+                if not line.strip():
+                    continue
                 role = "user" if line.startswith("User:") else "assistant"
-                messages.append({"role": role, "content": line.split(": ", 1)[1] if ": " in line else line})
+                content = line.split(": ", 1)[1] if ": " in line else line
+                messages.append({"role": role, "content": content})
 
             completion = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=messages,
             )
             response_text = (completion.choices[0].message.content or "").strip()
-        except Exception as e:
+        except Exception:
             logger.exception("OpenAI error")
             response_text = "Эх, давай просто выпьем за всё хорошее! 🥃"
 
         _save_history(session, user_id, user_name, "", response_text)
+    except Exception:
+        logger.exception("DB flow error in handle_message")
+        response_text = "Сегодня я немного не в форме, но бокальчик точно всё исправит! 🍷"
     finally:
         session.close()
 
@@ -180,10 +229,16 @@ async def handle_message(update: Update, context):
     except Exception:
         logger.exception("Failed to send message to chat %s", chat_id)
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Глобальный error handler PTB — все необработанные исключения попадут в лог.
+    """
+    logger.exception("PTB error_handler caught exception", exc_info=context.error)
 
 # Регистрация хендлеров
 tapp.add_handler(CommandHandler("start", start))
 tapp.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+tapp.add_error_handler(error_handler)
 
 # ---------------------------
 # FastAPI
@@ -234,12 +289,13 @@ async def telegram_webhook(token: str, request: Request):
             await tapp.process_update(update)  # требует .initialize() (см. startup)
         except Exception as e:
             logger.exception("process_update failed")
-            # Не шлём ответ в чат из вебхука (чтобы не зациклить/заспамить), просто 500 → Telegram перешлёт повтор
-            return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+            # 200, чтобы Telegram не долбил повторами — обработка ошибки уже залогирована
+            return JSONResponse(status_code=200, content={"ok": False, "error": str(e)})
         return JSONResponse(content={"ok": True})
     except Exception as e:
         logger.exception("Webhook error: %s", e)
-        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+        # 200 — чтобы телега не ретраила одно и то же событие бесконечно
+        return JSONResponse(status_code=200, content={"ok": False, "error": str(e)})
 
 
 @app.get("/")
