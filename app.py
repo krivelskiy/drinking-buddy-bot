@@ -1,4 +1,7 @@
 import os
+import re
+import time
+import random
 import logging
 from typing import Optional
 
@@ -6,13 +9,19 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackContext, ContextTypes, filters
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackContext,
+    ContextTypes,
+    filters,
+)
 
 from openai import OpenAI
 
-from sqlalchemy import create_engine, Column, Integer, String, Text, text
+from sqlalchemy import create_engine, Column, Integer, String, Text, text, inspect
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import inspect
 
 # ---------------------------
 # ЛОГИРОВАНИЕ
@@ -28,7 +37,7 @@ logger = logging.getLogger("app")
 # ---------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-APP_BASE_URL = os.getenv("APP_BASE_URL")  # напр. https://drinking-buddy-bot.onrender.com
+APP_BASE_URL = os.getenv("APP_BASE_URL")
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./memory.db")
 
 if not BOT_TOKEN:
@@ -55,7 +64,6 @@ Base = declarative_base()
 engine = create_engine(DATABASE_URL, echo=False, future=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
-
 class UserMemory(Base):
     __tablename__ = "user_memory"
     id = Column(Integer, primary_key=True, index=True)
@@ -64,17 +72,11 @@ class UserMemory(Base):
     favorite_drink = Column(String(100))
     history = Column(Text)
 
-
 def ensure_schema():
-    """
-    Безостановочный апгрейд схемы на проде.
-    Добиваемся наличия таблицы и нужных колонок.
-    """
     try:
         Base.metadata.create_all(bind=engine)
         insp = inspect(engine)
 
-        # Убедимся, что таблица существует
         if not insp.has_table("user_memory"):
             with engine.begin() as conn:
                 conn.execute(text("""
@@ -88,7 +90,6 @@ def ensure_schema():
                 """))
                 logger.info("ℹ️ Created table user_memory manually")
 
-        # Проверим недостающие колонки
         cols = {c["name"] for c in insp.get_columns("user_memory")}
         with engine.begin() as conn:
             if "favorite_drink" not in cols:
@@ -107,7 +108,6 @@ def ensure_schema():
         logger.exception("❌ ensure_schema failed: %s", e)
         raise
 
-
 try:
     ensure_schema()
     logger.info("✅ Database initialized")
@@ -119,15 +119,32 @@ except Exception as e:
 # ---------------------------
 tapp = Application.builder().token(BOT_TOKEN).build()
 
-# Стикеры
-STICKERS = {
-    "водка": "CAACAgIAAxkBAAEBjr5ouGBBx_1-DTY7HwkdW3rQWOcgRAACsIAAAiFbyEn_G4lgoMu7IjYE",
-    "виски": "CAACAgIAAxkBAAEBjsBouGBSGJX2UPfsKzHTIYlfD7eAswACDH8AAnEbyEnqwlOYBHZL3jYE",
-    "вино":  "CAACAgIAAxkBAAEBjsJouGBk6eEZ60zhrlVYxtaa6o1IpwACzoEAApg_wUm0xElTR8mU3zYE",
-    "пиво":  "CAACAgIAAxkBAAEBjsRouGBy8fdkWj0MhodvqLl3eT9fcgACX4cAAvmhwElmpyDuoHw7IjYE",
-    "грусть":  "CAACAgIAAxkBAAEBjrxouGAyqkcwuIJiCaINHEu-QVn4NAAC1IAAAhynyUnZmmKvP768xzYE",
-    "веселье": "CAACAgIAAxkBAAEBjrpouGAERwa1uHIJiB5lkhQZps-j_wACcoEAAlGlwEnCOTC-IwMCBDYE",
+# Стикеры (file_id)
+STICKER_ID = {
+    "vodka": "CAACAgIAAxkBAAEBjr5ouGBBx_1-DTY7HwkdW3rQWOcgRAACsIAAAiFbyEn_G4lgoMu7IjYE",
+    "whisky": "CAACAgIAAxkBAAEBjsBouGBSGJX2UPfsKzHTIYlfD7eAswACDH8AAnEbyEnqwlOYBHZL3jYE",
+    "wine": "CAACAgIAAxkBAAEBjsJouGBk6eEZ60zhrlVYxtaa6o1IpwACzoEAApg_wUm0xElTR8mU3zYE",
+    "beer": "CAACAgIAAxkBAAEBjsRouGBy8fdkWj0MhodvqLl3eT9fcgACX4cAAvmhwElmpyDuoHw7IjYE",
+    "sad": "CAACAgIAAxkBAAEBjrxouGAyqkcwuIJiCaINHEu-QVn4NAAC1IAAAhynyUnZmmKvP768xzYE",
+    "happy": "CAACAgIAAxkBAAEBjrpouGAERwa1uHIJiB5lkhQZps-j_wACcoEAAlGlwEnCOTC-IwMCBDYE",
 }
+
+# Регулярки → ключ
+STICKER_RULES: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\bпив(о|а|е|у|ом)?\b", re.IGNORECASE), "beer"),
+    (re.compile(r"\bbeer\b", re.IGNORECASE), "beer"),
+    (re.compile(r"\bвин(о|а|е|у|ом|ца)?\b", re.IGNORECASE), "wine"),
+    (re.compile(r"\bwine\b", re.IGNORECASE), "wine"),
+    (re.compile(r"\bводк(а|и|е|у|ой)?\b", re.IGNORECASE), "vodka"),
+    (re.compile(r"\bvodka\b", re.IGNORECASE), "vodka"),
+    (re.compile(r"\bвиск(и|аря|арю)?\b", re.IGNORECASE), "whisky"),
+    (re.compile(r"\bwhisk(e|)y\b", re.IGNORECASE), "whisky"),
+    (re.compile(r"\b(грустн|печаль|тоск)\w*\b", re.IGNORECASE), "sad"),
+    (re.compile(r"\b(весел|радост|кайф)\w*\b", re.IGNORECASE), "happy"),
+]
+
+_last_sticker_ts: dict[int, float] = {}
+STICKER_COOLDOWN_SEC = 5.0
 
 # ---------------------------
 # Хелперы памяти
@@ -138,7 +155,6 @@ def _save_history(session, user_id: int, user_name: str, user_text: str, bot_tex
         mem = UserMemory(user_id=user_id, name=user_name, favorite_drink="", history="")
         session.add(mem)
         session.flush()
-    # осторожно: если история NULL в БД
     if user_text:
         mem.history = (mem.history or "") + f"\nUser: {user_text}"
     if bot_text:
@@ -146,24 +162,33 @@ def _save_history(session, user_id: int, user_name: str, user_text: str, bot_tex
     session.commit()
     return mem
 
-
 def _maybe_extract_favorite_drink(mem: UserMemory, text_in: str) -> None:
     low = (text_in or "").lower()
-    if "любим" in low:
-        for drink in ("пиво", "вино", "водка", "виски"):
-            if drink in low:
-                mem.favorite_drink = drink
+    for key, label in [
+        ("пив", "пиво"), ("вин", "вино"), ("водк", "водка"), ("виск", "виски"),
+        ("beer", "пиво"), ("wine", "вино"), ("vodka", "водка"), ("whisky", "виски"), ("whiskey", "виски"),
+    ]:
+        if key in low:
+            mem.favorite_drink = label
+            break
+
+def pick_drink_sticker_by_name(name: str) -> str | None:
+    mapping = {"пиво": "beer", "вино": "wine", "водка": "vodka", "виски": "whisky"}
+    key = mapping.get((name or "").lower().strip())
+    return STICKER_ID.get(key) if key else None
+
+def maybe_send_sticker_for_text(text_in: str) -> str | None:
+    for rx, key in STICKER_RULES:
+        if rx.search(text_in or ""):
+            return STICKER_ID.get(key)
+    return None
 
 # ---------------------------
 # Хендлеры
 # ---------------------------
 async def start(update: Update, context: CallbackContext):
-    try:
-        text = "Привет! Я Катя. А как тебя зовут и что ты сегодня хочешь выпить?"
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=text)
-        logger.info("Sent /start greet to chat %s", update.effective_chat.id)
-    except Exception:
-        logger.exception("Failed to handle /start")
+    await context.bot.send_message(chat_id=update.effective_chat.id,
+                                   text="Привет! Я Катя. А как тебя зовут и что ты сегодня хочешь выпить?")
 
 async def handle_message(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
@@ -171,71 +196,83 @@ async def handle_message(update: Update, context: CallbackContext):
     user_id = user.id
     user_name = user.first_name
     user_text = update.message.text or ""
+    user_text_lower = user_text.lower()
 
-    # Стикеры по ключевым словам (до вызова модели)
-    for key, sid in STICKERS.items():
-        if key in user_text.lower():
-            try:
-                await context.bot.send_sticker(chat_id=chat_id, sticker=sid)
-                logger.info("Sticker sent (%s) to chat %s", key, chat_id)
-            except Exception:
-                logger.exception("Failed sending sticker %s", key)
+    now = time.time()
+    last_ts = _last_sticker_ts.get(chat_id, 0)
 
-    # Память и ответ
+    # sticker by user text
+    sticker_to_send: Optional[str] = maybe_send_sticker_for_text(user_text_lower)
+
+    # если пишет «пей/выпьем» → любимый напиток
+    if not sticker_to_send and re.search(r"\b(пей|выпьем|наливай)\b", user_text_lower):
+        session = SessionLocal()
+        try:
+            mem = session.query(UserMemory).filter_by(user_id=user_id).first()
+            sticker_to_send = pick_drink_sticker_by_name(mem.favorite_drink) if mem and mem.favorite_drink else STICKER_ID["beer"]
+        finally:
+            session.close()
+
+    if sticker_to_send and (now - last_ts) >= STICKER_COOLDOWN_SEC:
+        await context.bot.send_sticker(chat_id=chat_id, sticker=sticker_to_send)
+        _last_sticker_ts[chat_id] = now
+
+    # ---- GPT ----
     session = SessionLocal()
     try:
         mem = _save_history(session, user_id, user_name, user_text)
         _maybe_extract_favorite_drink(mem, user_text)
         session.commit()
 
-        # Ответ от модели (или fallback)
-        try:
-            if client is None:
-                raise RuntimeError("OpenAI client not initialized")
+        short_history = (mem.history or "").splitlines()[-20:]
+        system_prompt = (
+            "Ты — Катя, собутыльница. Женский тон, лёгкий флирт, юмор, дружелюбие. "
+            "Иногда сама инициируешь выпивание и предлагаешь тост."
+        )
+        messages = [{"role": "system", "content": system_prompt}]
+        for line in short_history:
+            if not line.strip():
+                continue
+            role = "user" if line.startswith("User:") else "assistant"
+            content = line.split(": ", 1)[1] if ": " in line else line
+            messages.append({"role": role, "content": content})
 
-            short_history = (mem.history or "").splitlines()[-20:]
-            system_prompt = (
-                "Ты — Катя, собутыльница. Женский тон, лёгкий флирт (уместно), юмор, "
-                "дружелюбие; даёшь мягкие психологические советы и поддерживаешь диалог. "
-                "Помни известные факты о собеседнике (имя, любимый напиток), "
-                "но не повторяй одно и то же в каждом сообщении."
-            )
-            messages = [{"role": "system", "content": system_prompt}]
-            for line in short_history:
-                if not line.strip():
-                    continue
-                role = "user" if line.startswith("User:") else "assistant"
-                content = line.split(": ", 1)[1] if ": " in line else line
-                messages.append({"role": role, "content": content})
-
-            completion = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=messages,
-            )
+        response_text = "Эх, давай просто выпьем за всё хорошее! 🥃"
+        if client:
+            completion = client.chat.completions.create(model="gpt-4o-mini", messages=messages)
             response_text = (completion.choices[0].message.content or "").strip()
-        except Exception:
-            logger.exception("OpenAI error")
-            response_text = "Эх, давай просто выпьем за всё хорошее! 🥃"
 
         _save_history(session, user_id, user_name, "", response_text)
-    except Exception:
-        logger.exception("DB flow error in handle_message")
-        response_text = "Сегодня я немного не в форме, но бокальчик точно всё исправит! 🍷"
     finally:
         session.close()
 
-    try:
-        await context.bot.send_message(chat_id=chat_id, text=response_text)
-    except Exception:
-        logger.exception("Failed to send message to chat %s", chat_id)
+    await context.bot.send_message(chat_id=chat_id, text=response_text)
+
+    # ---- Катя сама предлагает выпить (20%) ----
+    if random.random() < 0.2 and (time.time() - last_ts) >= STICKER_COOLDOWN_SEC:
+        session = SessionLocal()
+        fav_sticker = STICKER_ID["beer"]
+        try:
+            mem = session.query(UserMemory).filter_by(user_id=user_id).first()
+            if mem and mem.favorite_drink:
+                sid = pick_drink_sticker_by_name(mem.favorite_drink)
+                if sid:
+                    fav_sticker = sid
+        finally:
+            session.close()
+
+        toast_text = random.choice([
+            "Давай я первая подниму бокал! 🥂 За нас!",
+            "Ну что, предлагаю тост: за хорошее настроение! 🍻",
+            "Я налила! Поднимем бокалы и выпьем вместе! 🍷",
+        ])
+        await context.bot.send_message(chat_id=chat_id, text=toast_text)
+        await context.bot.send_sticker(chat_id=chat_id, sticker=fav_sticker)
+        _last_sticker_ts[chat_id] = time.time()
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Глобальный error handler PTB — все необработанные исключения попадут в лог.
-    """
     logger.exception("PTB error_handler caught exception", exc_info=context.error)
 
-# Регистрация хендлеров
 tapp.add_handler(CommandHandler("start", start))
 tapp.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 tapp.add_error_handler(error_handler)
@@ -247,56 +284,24 @@ app = FastAPI()
 
 @app.on_event("startup")
 async def _startup():
-    """
-    ВАЖНО: для ручной обработки вебхуков через FastAPI нужно явно инициализировать PTB Application.
-    """
-    try:
-        await tapp.initialize()
-        logger.info("✅ PTB Application initialized")
-    except Exception:
-        logger.exception("❌ PTB Application initialize failed")
-
-    # Ставим вебхук, если есть базовый URL
+    await tapp.initialize()
     if APP_BASE_URL:
-        try:
-            wh_url = f"{APP_BASE_URL}/webhook/{BOT_TOKEN}"
-            await tapp.bot.set_webhook(url=wh_url, allowed_updates=["message"])
-            logger.info("✅ Webhook set to %s", wh_url)
-        except Exception:
-            logger.exception("❌ set_webhook failed")
-
+        wh_url = f"{APP_BASE_URL}/webhook/{BOT_TOKEN}"
+        await tapp.bot.set_webhook(url=wh_url, allowed_updates=["message"])
+        logger.info("✅ Webhook set to %s", wh_url)
 
 @app.on_event("shutdown")
 async def _shutdown():
-    try:
-        await tapp.shutdown()
-        logger.info("✅ PTB Application shutdown")
-    except Exception:
-        logger.exception("❌ PTB Application shutdown failed")
-
+    await tapp.shutdown()
 
 @app.post("/webhook/{token}")
 async def telegram_webhook(token: str, request: Request):
     if token != BOT_TOKEN:
-        logger.warning("Webhook hit with wrong token")
         return JSONResponse(status_code=403, content={"ok": False, "error": "Forbidden"})
-
-    try:
-        data = await request.json()
-        update = Update.de_json(data, tapp.bot)  # PTB v20: обязателен bot вторым аргументом
-        logger.info("Incoming update_id=%s", getattr(update, "update_id", "n/a"))
-        try:
-            await tapp.process_update(update)  # требует .initialize() (см. startup)
-        except Exception as e:
-            logger.exception("process_update failed")
-            # 200, чтобы Telegram не долбил повторами — обработка ошибки уже залогирована
-            return JSONResponse(status_code=200, content={"ok": False, "error": str(e)})
-        return JSONResponse(content={"ok": True})
-    except Exception as e:
-        logger.exception("Webhook error: %s", e)
-        # 200 — чтобы телега не ретраила одно и то же событие бесконечно
-        return JSONResponse(status_code=200, content={"ok": False, "error": str(e)})
-
+    data = await request.json()
+    update = Update.de_json(data, tapp.bot)
+    await tapp.process_update(update)
+    return JSONResponse(content={"ok": True})
 
 @app.get("/")
 async def health():
