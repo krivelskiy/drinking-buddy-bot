@@ -70,6 +70,34 @@ def init_db():
                 message_id INTEGER
             )
         """))
+        
+        # Добавляем недостающие колонки к существующим таблицам
+        try:
+            # Добавляем колонку age к users если её нет
+            conn.execute(DDL(f"""
+                ALTER TABLE {USERS_TABLE} 
+                ADD COLUMN IF NOT EXISTS age INTEGER
+            """))
+        except Exception:
+            pass  # Колонка уже существует
+            
+        try:
+            # Добавляем колонку message_id к messages если её нет
+            conn.execute(DDL(f"""
+                ALTER TABLE {MESSAGES_TABLE} 
+                ADD COLUMN IF NOT EXISTS message_id INTEGER
+            """))
+        except Exception:
+            pass  # Колонка уже существует
+            
+        try:
+            # Добавляем колонку reply_to_message_id к messages если её нет
+            conn.execute(DDL(f"""
+                ALTER TABLE {MESSAGES_TABLE} 
+                ADD COLUMN IF NOT EXISTS reply_to_message_id INTEGER
+            """))
+        except Exception:
+            pass  # Колонка уже существует
     
     logger.info("✅ Database tables created/verified")
 
@@ -125,7 +153,7 @@ def upsert_user_from_update(update: Update) -> None:
 
     with engine.begin() as conn:
         row = conn.execute(
-            text(f"SELECT {U['id']} FROM {USERS_TABLE} WHERE {U['user_tg_id']} = :tg_id"),
+            text(f"SELECT {U['user_tg_id']} FROM {USERS_TABLE} WHERE {U['user_tg_id']} = :tg_id"),
             {"tg_id": tg_id},
         ).fetchone()
 
