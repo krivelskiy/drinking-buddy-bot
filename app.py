@@ -1,4 +1,6 @@
 import os
+import httpx
+import re
 import logging
 from datetime import datetime
 from typing import Optional
@@ -7,7 +9,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, DDL
 from sqlalchemy.engine import Engine
 
 from telegram import Update
@@ -15,8 +17,11 @@ from telegram.ext import Application, MessageHandler, ContextTypes, filters
 
 from openai import OpenAI
 
-from config import DATABASE_URL, OPENAI_API_KEY, BOT_TOKEN
-from constants import STICKERS, DRINK_KEYWORDS, DB_FIELDS, FALLBACK_OPENAI_UNAVAILABLE
+from config import DATABASE_URL, OPENAI_API_KEY, BOT_TOKEN, RENDER_EXTERNAL_URL
+from constants import (
+    STICKERS, DRINK_KEYWORDS, DB_FIELDS, FALLBACK_OPENAI_UNAVAILABLE,
+    USERS_TABLE, MESSAGES_TABLE, BEER_STICKERS, STICKER_TRIGGERS
+)
 
 # -----------------------------
 # Логирование
