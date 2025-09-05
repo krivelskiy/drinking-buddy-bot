@@ -1,305 +1,293 @@
-import asyncio
+import os
 import json
 import logging
-import os
-from typing import Any, Dict, Optional
+from datetime import datetime
 
-import httpx
-from fastapi import FastAPI, HTTPException, Request, status
-from fastapi.responses import PlainTextResponse, JSONResponse
-from openai import OpenAI
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
+from openai import OpenAI
+from telegram import Update
+from telegram.ext import Application, ApplicationBuilder, MessageHandler, filters
 
-# ВАЖНО: всё, что связано со схемой и именами полей, берём только из constants
-from constants import STICKERS, DRINK_KEYWORDS, DB_FIELDS, FALLBACK_OPENAI_UNAVAILABLE
+from constants import (
+    STICKERS,
+    DRINK_KEYWORDS,
+    DB_FIELDS,
+    FALLBACK_OPENAI_UNAVAILABLE,
+)
+from config import DATABASE_URL, OPENAI_API_KEY, WEBHOOK_URL, BOT_TOKEN
 
-# ------- конфиг ключей (строго по договорённостям)
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-BASE_URL = os.getenv("BASE_URL", os.getenv("RENDER_EXTERNAL_URL", "")).rstrip("/")
 
-# ------- логирование
+# ---------- ЛОГИ ----------
+
 logger = logging.getLogger("app")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
 
-# ------- FastAPI app (обязательно app)
-app = FastAPI(title="Drinking Buddy Bot", version="1.0.1")
+# ---------- FASTAPI ----------
+app = FastAPI(title="Drinking Buddy Bot")
 
-# =========================================
-# DB
-# =========================================
-_engine: Optional[Engine] = None
+# ---------- DB ----------
+engine: Engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
 
-
-def _init_db_engine() -> Engine:
-    if not DATABASE_URL:
-        logger.warning("DATABASE_URL is empty — DB features will be disabled")
-    eng = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=1800)
-    return eng
+UF = DB_FIELDS["users"]  # сокращение
 
 
-def db_exec(sql: str, **params):
-    global _engine
-    if _engine is None:
-        _engine = _init_db_engine()
-        logger.info("✅ Database initialized")
-    with _engine.begin() as conn:
-        return conn.execute(text(sql), params)
+def _now_str() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def upsert_user_from_update(message: Dict[str, Any]) -> None:
-    """Создаёт/обновляет пользователя по incoming message (имена полей из DB_FIELDS)."""
-    if not DATABASE_URL:
-        return
+def ensure_user_row(update: Update):
+    """Создаём/обновляем пользователя (upsert по chat_id) без «зашивки» полей."""
+    chat_id = update.effective_chat.id
+    user = update.effective_user
 
-    users = DB_FIELDS["users"]  # Имена колонок берём только из constants
-    chat = message.get("chat") or {}
-    user = message.get("from") or {}
+    with engine.begin() as conn:
+        # есть ли запись?
+        exists = conn.execute(
+            text(f"SELECT 1 FROM users WHERE {UF['pk']} = :cid"),
+            {"cid": chat_id},
+        ).first()
 
-    chat_id = chat.get("id")
-    tg_id = user.get("id")
-    username = user.get("username")
-    first_name = user.get("first_name")
-    last_name = user.get("last_name")
+        payload = {
+            "chat_id": chat_id,
+            "tg_id": user.id if user else None,
+            "username": (user.username or None) if user else None,
+            "first_name": (user.first_name or None) if user else None,
+            "last_name": (user.last_name or None) if user else None,
+            "updated_at": _now_str(),
+        }
 
-    if chat_id is None or tg_id is None:
-        return
-
-    sql = f"""
-    INSERT INTO users ({users['pk']}, {users['tg_id']}, {users['username']}, {users['first_name']}, {users['last_name']})
-    VALUES (:chat_id, :tg_id, :username, :first_name, :last_name)
-    ON CONFLICT ({users['pk']}) DO UPDATE SET
-        {users['tg_id']} = EXCLUDED.{users['tg_id']},
-        {users['username']} = EXCLUDED.{users['username']},
-        {users['first_name']} = EXCLUDED.{users['first_name']},
-        {users['last_name']} = EXCLUDED.{users['last_name']},
-        {users['updated_at']} = now();
-    """
-    db_exec(
-        sql,
-        chat_id=chat_id,
-        tg_id=tg_id,
-        username=username,
-        first_name=first_name,
-        last_name=last_name,
-    )
-
-
-def load_user_context(chat_id: int) -> Dict[str, Any]:
-    """Возвращает summary/favorite_drinks/name как контекст (имена полей из DB_FIELDS)."""
-    if not DATABASE_URL:
-        return {}
-    users = DB_FIELDS["users"]
-    sql = f"""
-        SELECT {users['summary']} AS summary,
-               {users['favorite_drinks']} AS favorite_drinks,
-               {users['name']} AS name
-        FROM users
-        WHERE {users['pk']} = :chat_id
-    """
-    row = db_exec(sql, chat_id=chat_id).mappings().first()
-    if not row:
-        return {}
-    return {
-        "summary": row.get("summary"),
-        "favorite_drinks": row.get("favorite_drinks") or [],
-        "name": row.get("name"),
-    }
-
-
-# =========================================
-# Telegram API (без PTB)
-# =========================================
-TG_API = "https://api.telegram.org"
-
-
-async def tg_send_text(chat_id: int, text: str) -> None:
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN is empty — cannot send messages")
-        return
-    url = f"{TG_API}/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text}
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.post(url, json=payload)
-        if r.status_code != 200:
-            logger.error("sendMessage failed: %s %s", r.status_code, r.text)
-
-
-async def tg_send_sticker(chat_id: int, sticker_id: str) -> None:
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN is empty — cannot send stickers")
-        return
-    url = f"{TG_API}/bot{BOT_TOKEN}/sendSticker"
-    payload = {"chat_id": chat_id, "sticker": sticker_id}
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.post(url, json=payload)
-        if r.status_code != 200:
-            logger.error("sendSticker failed: %s %s", r.status_code, r.text)
-
-
-async def tg_set_webhook() -> None:
-    if not (BOT_TOKEN and BASE_URL):
-        if not BOT_TOKEN:
-            logger.warning("BOT_TOKEN is empty (webhook работать не будет)")
-        if not BASE_URL:
-            logger.warning("BASE_URL is empty (webhook не будет выставлен)")
-        return
-    url = f"{TG_API}/bot{BOT_TOKEN}/setWebhook"
-    webhook_url = f"{BASE_URL}/webhook/{BOT_TOKEN}"
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.post(url, json={"url": webhook_url})
-        if r.status_code == 200:
-            logger.info("✅ Webhook set to %s", webhook_url)
+        if exists:
+            conn.execute(
+                text(
+                    f"""
+                    UPDATE users
+                    SET {UF['tg_id']}=:tg_id,
+                        {UF['username']}=:username,
+                        {UF['first_name']}=:first_name,
+                        {UF['last_name']}=:last_name,
+                        {UF['updated_at']}=:updated_at
+                    WHERE {UF['pk']}=:chat_id
+                    """
+                ),
+                payload,
+            )
         else:
-            logger.error("setWebhook failed: %s %s", r.status_code, r.text)
+            payload.update(
+                {
+                    "name": None,
+                    "favorite_drinks": json.dumps([]),
+                    "summary": None,
+                    "free_drinks": 0,
+                    "created_at": _now_str(),
+                }
+            )
+            conn.execute(
+                text(
+                    f"""
+                    INSERT INTO users
+                        ({UF['pk']},{UF['tg_id']},{UF['username']},{UF['first_name']},
+                         {UF['last_name']},{UF['name']},{UF['favorite_drinks']},
+                         {UF['summary']},{UF['free_drinks']},{UF['created_at']},{UF['updated_at']})
+                    VALUES
+                        (:chat_id,:tg_id,:username,:first_name,:last_name,
+                         :name,:favorite_drinks,:summary,:free_drinks,:created_at,:updated_at)
+                    """
+                ),
+                payload,
+            )
 
 
-# =========================================
-# OpenAI
-# =========================================
-def build_openai_client() -> Optional[OpenAI]:
-    if not OPENAI_API_KEY:
-        logger.warning("OPENAI_API_KEY is empty — conversations will use fallback")
-        return None
+def get_user_summary(chat_id: int) -> str:
+    with engine.begin() as conn:
+        row = conn.execute(
+            text(f"SELECT {UF['summary']} FROM users WHERE {UF['pk']}=:cid"),
+            {"cid": chat_id},
+        ).first()
+        return row[0] or "" if row else ""
+
+
+def set_user_summary(chat_id: int, new_summary: str):
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                f"UPDATE users SET {UF['summary']}=:summary,{UF['updated_at']}=:ts WHERE {UF['pk']}=:cid"
+            ),
+            {"summary": new_summary, "ts": _now_str(), "cid": chat_id},
+        )
+
+
+def append_turn_to_summary(chat_id: int, user_text: str, bot_text: str, max_len: int = 8000):
+    """Храним краткую «сжатую» историю в users.summary (персистентно)."""
+    old = get_user_summary(chat_id)
+    line_u = f"[U] {user_text.strip()}"
+    line_b = f"[B] {bot_text.strip()}"
+    new = (old + "\n" if old else "") + f"{line_u}\n{line_b}"
+    # Усечение по длине (с головы)
+    if len(new) > max_len:
+        new = new[-max_len:]
+        # подрезаем до начала строки
+        new = new[new.find("\n") + 1 :] if "\n" in new else new
+    set_user_summary(chat_id, new)
+
+
+# ---------- OpenAI ----------
+client: OpenAI | None = None
+if OPENAI_API_KEY:
     try:
         client = OpenAI(api_key=OPENAI_API_KEY)
         logger.info("✅ OpenAI client initialized")
-        return client
     except Exception as e:
         logger.exception("OpenAI init failed: %s", e)
-        return None
+        client = None
+else:
+    logger.warning("⚠️ OPENAI_API_KEY пуст — диалог будет отключён")
 
 
-_openai_client: Optional[OpenAI] = None
+# ---------- Telegram ----------
+tapp: Application | None = None
 
 
-async def ai_reply(user_text: str, user_ctx: Dict[str, Any]) -> Optional[str]:
-    """Все диалоги только через OpenAI. При сбое — вернём None (отправим заглушку)."""
-    global _openai_client
-    if _openai_client is None:
-        _openai_client = build_openai_client()
-    if _openai_client is None:
-        return None
+def build_telegram_app() -> Application:
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is not set")
+    return (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(set_webhook_on_startup)
+        .build()
+    )
 
-    summary = (user_ctx.get("summary") or "").strip()
-    fav = user_ctx.get("favorite_drinks") or []
-    name = (user_ctx.get("name") or "").strip()
 
-    sys_parts = [
-        "Ты — Катя Собутыльница: дружелюбная, остроумная, позитивная.",
-        "Отвечай коротко и по делу, с лёгкой иронией. Не повторяй сообщения пользователя.",
-        "Если собеседник спросит факты о себе — используй контекст из БД, если он есть.",
-        "Никаких платёжных сценариев сейчас не запускай.",
+async def set_webhook_on_startup(app_: Application):
+    """Ставим вебхук при инициализации приложения Telegram."""
+    if not WEBHOOK_URL:
+        logger.warning("⚠️ WEBHOOK_URL пуст — вебхук не будет поставлен")
+        return
+    url = f"{WEBHOOK_URL.rstrip('/')}/webhook/{BOT_TOKEN}"
+    ok = await app_.bot.set_webhook(url=url)
+    if ok:
+        logger.info("✅ Webhook set to %s", url)
+    else:
+        logger.error("❌ Failed to set webhook to %s", url)
+
+
+def pick_drink_sticker(text_in: str) -> str | None:
+    t = (text_in or "").lower()
+    for kw, key in DRINK_KEYWORDS.items():
+        if kw in t:
+            return STICKERS.get(key)
+    return None
+
+
+async def handle_text(update: Update, context):
+    chat_id = update.effective_chat.id
+    ensure_user_row(update)
+
+    user_msg = update.effective_message.text or ""
+
+    # Стикер за напиток — отдельно от диалога
+    st = pick_drink_sticker(user_msg)
+    if st:
+        try:
+            await context.bot.send_sticker(chat_id=chat_id, sticker=st)
+        except Exception as e:
+            logger.warning("Sticker send failed: %s", e)
+
+    # Если OpenAI недоступен — строгое поведение-заглушка
+    if client is None:
+        await context.bot.send_message(chat_id=chat_id, text=FALLBACK_OPENAI_UNAVAILABLE)
+        # Историю не продолжаем (по вашим требованиям — «не вести диалог»)
+        return
+
+    # Подмешиваем долговременную «сжатую» память
+    summary = get_user_summary(chat_id).strip()
+    sys_prompt = (
+        "Ты — Катя Собутыльница. Отвечай дружелюбно, кратко, по-русски. "
+        "Поддерживай лёгкую атмосферу бара. Если пользователь сообщил факты о себе, помни их."
+    )
+
+    messages = [
+        {"role": "system", "content": sys_prompt},
     ]
-    if name:
-        sys_parts.append(f"Имя собеседника: {name}.")
     if summary:
-        sys_parts.append(f"Краткое описание собеседника: {summary}.")
-    if fav:
-        sys_parts.append(f"Любимые напитки собеседника: {', '.join(map(str, fav))}.")
-
-    system_prompt = " ".join(sys_parts)
+        messages.append(
+            {
+                "role": "system",
+                "content": f"Краткая долговременная память о пользователе и прошлом общении:\n{summary}",
+            }
+        )
+    messages.append({"role": "user", "content": user_msg})
 
     try:
-        resp = _openai_client.chat.completions.create(
+        resp = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_text},
-            ],
-            temperature=0.7,
+            messages=messages,
+            temperature=0.6,
         )
-        return (resp.choices[0].message.content or "").strip()
+        bot_text = (resp.choices[0].message.content or "").strip() or "Эм…"
     except Exception as e:
-        logger.exception("OpenAI error: %s", e)
-        return None
+        logger.warning("OpenAI failed: %s", e)
+        await context.bot.send_message(chat_id=chat_id, text=FALLBACK_OPENAI_UNAVAILABLE)
+        return
+
+    await context.bot.send_message(chat_id=chat_id, text=bot_text)
+
+    # После удачного ответа — сохраняем ход диалога в summary
+    try:
+        append_turn_to_summary(chat_id, user_msg, bot_text)
+    except Exception as e:
+        logger.warning("append_turn_to_summary failed: %s", e)
 
 
-# =========================================
-# Startup
-# =========================================
-@app.on_event("startup")
-async def on_startup():
-    if DATABASE_URL:
-        global _engine
-        _engine = _init_db_engine()
-    else:
-        logger.warning("DATABASE_URL is empty (DB features disabled)")
-    await tg_set_webhook()
+# ---------- FastAPI схемы ----------
+class TelegramUpdate(BaseModel):
+    update_id: int | None = None
+    message: dict | None = None
+    edited_message: dict | None = None
+    callback_query: dict | None = None
+    # остальные поля нам не критичны для валидации
 
 
-# =========================================
-# Routes
-# =========================================
+# ---------- ROUTES ----------
 @app.get("/", response_class=PlainTextResponse)
 async def root():
     return "OK"
 
 
-@app.get("/health", response_class=PlainTextResponse)
-async def health():
-    return "healthy"
-
-
-@app.get("/db/schema", response_class=JSONResponse)
-async def db_schema():
-    """
-    Возвращаем структуру ТОЛЬКО из constants.DB_FIELDS,
-    без хардкода типов/названий в приложении.
-    """
-    return {"db_fields": DB_FIELDS}
-
-
 @app.post("/webhook/{token}")
 async def telegram_webhook(token: str, request: Request):
-    """
-    Принимаем апдейты Telegram.
-    Требуем строгого совпадения token в пути с BOT_TOKEN — иначе 403.
-    """
-    if not BOT_TOKEN or token != BOT_TOKEN:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="wrong token in path")
+    # принимаем только от нашего бота
+    if token != BOT_TOKEN:
+        return Response(status_code=403)
 
-    payload = await request.json()
-    logger.info("Incoming update: %s", payload.get("update_id"))
+    data = await request.json()
+    update = Update.de_json(data, bot=tapp.bot)  # type: ignore
+    await tapp.process_update(update)  # type: ignore
+    return Response(status_code=200)
 
-    message = payload.get("message") or payload.get("edited_message")
-    if not message:
-        return {"ok": True}
 
-    chat = message.get("chat") or {}
-    chat_id = chat.get("id")
-    if chat_id is None:
-        return {"ok": True}
+# ---------- LIFECYCLE ----------
+@app.on_event("startup")
+async def on_startup():
+    global tapp
+    tapp = build_telegram_app()
+    # основной обработчик текста
+    tapp.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+    await tapp.initialize()
+    await tapp.start()
+    logger.info("✅ Telegram application started")
 
-    text = (message.get("text") or "").strip()
 
-    # 1) апсертим пользователя (имена колонок из constants)
-    try:
-        upsert_user_from_update(message)
-    except Exception as e:
-        logger.exception("User upsert failed: %s", e)
-
-    # 2) распознаём напиток — отправляем стикер из constants.STICKERS
-    lowered = text.lower()
-    for kw, sticker_key in DRINK_KEYWORDS.items():
-        if kw in lowered:
-            sticker_id = STICKERS[sticker_key]
-            await tg_send_sticker(chat_id, sticker_id)
-            break
-
-    # 3) отвечаем ТОЛЬКО через OpenAI; при ошибке — заглушка и без продолжения
-    user_ctx = {}
-    try:
-        user_ctx = load_user_context(chat_id)
-    except Exception as e:
-        logger.exception("load_user_context failed: %s", e)
-
-    reply = await ai_reply(text, user_ctx)
-    if reply is None:
-        await tg_send_text(chat_id, FALLBACK_OPENAI_UNAVAILABLE)
-        return {"ok": True}
-
-    await tg_send_text(chat_id, reply)
-    return {"ok": True}
+@app.on_event("shutdown")
+async def on_shutdown():
+    if tapp:
+        await tapp.stop()
+        await tapp.shutdown()
+        logger.info("🛑 Telegram application stopped")
