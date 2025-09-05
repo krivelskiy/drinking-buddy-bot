@@ -1,6 +1,7 @@
 # app.py
 import os
 import logging
+import random
 from datetime import datetime, timezone
 from typing import Optional, Tuple, List
 
@@ -24,9 +25,9 @@ from telegram.ext import (
     ContextTypes, filters, PreCheckoutQueryHandler,
 )
 
-# -----------------------------------------------------------------------------
+# =========================
 # Конфиг и логирование
-# -----------------------------------------------------------------------------
+# =========================
 load_dotenv()
 
 log = logging.getLogger("app")
@@ -35,31 +36,32 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
-# читаем токен из любого удобного имени
 BOT_TOKEN = (
     os.getenv("BOT_TOKEN")
     or os.getenv("TELEGRAM_BOT_TOKEN")
     or os.getenv("TELEGRAM_TOKEN")
     or os.getenv("TELEGRAM_API_TOKEN")
     or ""
-)
+).strip()
 
-APP_BASE_URL = os.getenv("APP_BASE_URL", "")  # напр.: https://drinking-buddy-bot.onrender.com
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./db.sqlite3")
-PAYMENT_PROVIDER_TOKEN = os.getenv("PAYMENT_PROVIDER_TOKEN", "")
+APP_BASE_URL = os.getenv("APP_BASE_URL", "").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./db.sqlite3").strip()
+PAYMENT_PROVIDER_TOKEN = os.getenv("PAYMENT_PROVIDER_TOKEN", "").strip()
 
 if not OPENAI_API_KEY:
-    log.warning("OPENAI_API_KEY is empty")
+    log.warning("OPENAI_API_KEY is empty (будет offline-ответ)")
+
 if not BOT_TOKEN:
-    log.warning("BOT_TOKEN is empty (webhook/бот работать не будет)")
+    log.warning("BOT_TOKEN is empty (webhook не поднимется)")
+
 if not APP_BASE_URL:
     log.warning("APP_BASE_URL is empty (webhook не будет установлен)")
 
-# -----------------------------------------------------------------------------
+# =========================
 # БД (SQLAlchemy)
-# -----------------------------------------------------------------------------
+# =========================
 engine = sa.create_engine(DATABASE_URL, future=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 Base = declarative_base()
@@ -75,7 +77,6 @@ class User(Base):
     updated_at = sa.Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
     transactions = relationship("GiftTransaction", back_populates="user", cascade="all, delete-orphan")
-
 
 class GiftTransaction(Base):
     __tablename__ = "gift_transactions"
@@ -93,22 +94,85 @@ class GiftTransaction(Base):
 
     user = relationship("User", back_populates="transactions")
 
-
 def init_db():
     Base.metadata.create_all(bind=engine)
     log.info("✅ Database initialized")
 
+# =========================
+# OpenAI (безопасно с фолбэком)
+# =========================
+_openai_client = None
+if OPENAI_API_KEY:
+    try:
+        from openai import OpenAI
+        _openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        log.info("✅ OpenAI client initialized")
+    except Exception as e:
+        log.exception("OpenAI init failed: %s", e)
+        _openai_client = None
 
-# -----------------------------------------------------------------------------
-# OpenAI — заглушка: чат не зависит от оплат
-# -----------------------------------------------------------------------------
+FALLBACK_REPLIES = [
+    "Расскажи больше 🙂",
+    "Звучит интересно! Хочешь обсудить подробнее?",
+    "Понимаю. Что ты думаешь по этому поводу?",
+    "А как бы ты сам(а) ответил(а)?",
+    "Окей! Чем могу помочь прямо сейчас?",
+    "Принято. Давай разберёмся!",
+]
+
+def _normalize(s: str) -> str:
+    return "".join(ch for ch in s.lower().strip() if ch.isalnum() or ch.isspace())
+
 async def ask_llm(prompt: str) -> str:
-    return f"🤖 {prompt}"
+    """Никогда не зеркалим пользователю его же текст."""
+    # простые реакции без API — быстро и безопасно
+    async def safe_local_reply(inp: str) -> str:
+        if not inp:
+            return "Я тут! Что расскажешь? 🙂"
+        if inp.endswith("?"):
+            return "Хороший вопрос! Я бы сказал, что всё зависит от контекста. Что именно тебя волнует?"
+        return random.choice(FALLBACK_REPLIES)
 
+    # если нет клиента — оффлайн-ответ
+    if _openai_client is None:
+        reply = await safe_local_reply(prompt)
+        # защита от зеркала
+        if _normalize(reply) == _normalize(prompt):
+            reply = "Понял тебя. Можешь уточнить мысль одним-двумя предложениями?"
+        return reply
 
-# -----------------------------------------------------------------------------
+    # есть клиент — пробуем LLM
+    try:
+        # короткая и безопасная подсказка, чтобы не возвращать эхо
+        system = (
+            "Ты дружелюбный собеседник. Отвечай кратко (1–2 предложения). "
+            "Никогда не повторяй текст пользователя дословно и не отвечай только эмодзи."
+        )
+        resp = _openai_client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt[:2000]},
+            ],
+            temperature=0.6,
+            max_tokens=120,
+        )
+        reply = (resp.choices[0].message.content or "").strip()
+        if not reply:
+            reply = await safe_local_reply(prompt)
+    except Exception as e:
+        log.exception("OpenAI error: %s", e)
+        reply = await safe_local_reply(prompt)
+
+    # финальная защита от зеркала
+    if _normalize(reply) == _normalize(prompt):
+        reply = "Понимаю тебя. Давай конкретизируем — о чём именно речь?"
+
+    return reply
+
+# =========================
 # Утилиты БД
-# -----------------------------------------------------------------------------
+# =========================
 def get_or_create_user(session, chat_id: int, username: Optional[str], first_name: Optional[str], last_name: Optional[str]) -> User:
     user = session.execute(sa.select(User).where(User.chat_id == chat_id)).scalar_one_or_none()
     if user is None:
@@ -133,10 +197,9 @@ def get_or_create_user(session, chat_id: int, username: Optional[str], first_nam
             session.flush()
     return user
 
-
-# -----------------------------------------------------------------------------
-# Магазин напитков за звезды
-# -----------------------------------------------------------------------------
+# =========================
+# Магазин напитков за 1⭐
+# =========================
 DRINKS: List[Tuple[str, str, int]] = [
     ("espresso", "Эспрессо ☕", 1),
     ("latte", "Латте 🥛☕", 1),
@@ -156,12 +219,12 @@ def find_drink(slug: str) -> Optional[Tuple[str, str, int]]:
             return d
     return None
 
-
-# -----------------------------------------------------------------------------
+# =========================
 # Telegram Bot
-# -----------------------------------------------------------------------------
+# =========================
 tapp: Optional[Application] = None
 app = FastAPI()
+tapp_initialized = False
 
 class WebhookUpdate(BaseModel):
     update_id: int
@@ -180,7 +243,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if not chat:
         return
-
     with SessionLocal() as session:
         get_or_create_user(
             session,
@@ -190,7 +252,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             last_name=update.effective_user.last_name if update.effective_user else None,
         )
         session.commit()
-
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("Купить напиток (1⭐)", callback_data="open_shop")]])
     if update.message:
         await update.message.reply_text(
@@ -226,20 +287,16 @@ async def buy_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not q:
         return
     await q.answer()
-
     slug = q.data.split(":", 1)[1] if q.data and ":" in q.data else ""
     drink = find_drink(slug)
     if not drink:
         await q.message.reply_text("Не нашёл такой напиток 🙈")
         return
-
     if not PAYMENT_PROVIDER_TOKEN:
         await q.message.reply_text("Оплата звёздами сейчас недоступна. Попробуй позже 🙏")
         return
-
     _, title, price_stars = drink
     prices = [LabeledPrice(label=title, amount=price_stars)]  # 1⭐
-
     payload = f"drink:{slug}"
     try:
         await q.message.reply_invoice(
@@ -309,11 +366,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         await update.message.reply_text(reply)
 
-
 def build_bot() -> Optional[Application]:
     if not BOT_TOKEN:
         return None
-
     application = ApplicationBuilder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
@@ -327,32 +382,25 @@ def build_bot() -> Optional[Application]:
     # текст — в конце
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # платёжные хендлеры добавим после инициализации в on_startup
     return application
 
-
-# -----------------------------------------------------------------------------
+# =========================
 # FastAPI + webhook
-# -----------------------------------------------------------------------------
-tapp_initialized = False
-
+# =========================
 @app.on_event("startup")
 async def on_startup():
     global tapp, tapp_initialized
     init_db()
     try:
         tapp = build_bot()
-
         if tapp:
-            # инициализация и запуск PTB-приложения (обязательно для process_update)
             await tapp.initialize()
 
-            # платёжные хендлеры (после initialize, до start)
+            # платёжные хендлеры (после initialize)
             tapp.add_handler(PreCheckoutQueryHandler(precheckout_handler))
-            # В PTB 20.6 корректный фильтр:
             tapp.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
 
-            # ставим вебхук
+            # webhook
             if APP_BASE_URL:
                 wh_url = f"{APP_BASE_URL}/webhook/{BOT_TOKEN}"
                 await tapp.bot.set_webhook(
@@ -363,7 +411,6 @@ async def on_startup():
             else:
                 log.warning("Webhook not set: APP_BASE_URL is empty")
 
-            # запускаем PTB (иначе RuntimeError при process_update)
             await tapp.start()
             tapp_initialized = True
         else:
