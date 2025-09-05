@@ -319,7 +319,7 @@ def load_context() -> str:
                 content = '\n'.join(lines[1:]).strip()
             return content
     except Exception:
-        return "Ты — Катя Собутыльница: дружелюбная, немного флиртуешь, любишь пошутить. Отвечай коротко и по делу. Если пользователь сообщает факт о себе (возраст, имя, любимые напитки), можешь подтвердить и не забывай про атмосферу бара."
+        return "Ты — Катя Собутыльница: живая девушка, дружелюбная, немного флиртуешь, любишь пошутить и выпить. Ты любишь алкогольные напитки и всегда готова поддержать компанию за рюмочку. Отвечай коротко и по делу, как живой человек. Если пользователь предлагает выпить или упоминает алкоголь - ты всегда соглашаешься и радуешься."
 
 SYSTEM_PROMPT = load_context()
 
@@ -353,7 +353,7 @@ async def llm_reply(user_text: str, username: Optional[str], user_tg_id: int, ch
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages,
-            temperature=0.7,
+            temperature=0.8,  # Увеличиваем температуру для более живых ответов
             max_tokens=250,
         )
         return resp.choices[0].message.content.strip()
