@@ -2,8 +2,8 @@ import os
 import logging
 from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi import FastAPI, Request, Response, Query
+from fastapi.responses import JSONResponse
 
 from sqlalchemy import create_engine, text, inspect, MetaData, Table
 from sqlalchemy.engine import Engine
@@ -16,17 +16,14 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 # ЛОГИРОВАНИЕ
 # ---------------------------
 logger = logging.getLogger("app")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 # ---------------------------
-# КОНФИГ
+# КОНФИГ (ТОЛЬКО ТАКИЕ КЛЮЧИ!)
 # ---------------------------
 APP_BASE_URL = os.getenv("APP_BASE_URL", "").rstrip("/")
 AUTO_SET_WEBHOOK = os.getenv("AUTO_SET_WEBHOOK", "true").lower() in ("1", "true", "yes", "y")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()  # <-- ТОЛЬКО ЭТОТ КЛЮЧ
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
@@ -38,61 +35,104 @@ OPENAI_FALLBACK = "Извини, у меня временные неполадк
 def build_engine() -> Engine:
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not set")
-    eng = create_engine(
-        DATABASE_URL,
-        pool_pre_ping=True,
-        future=True,
-    )
-    return eng
+    return create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
 
 engine: Engine = build_engine()
 
-# ленивое отражение таблицы users (чтобы не рисковать несоответствием схемы)
 _metadata = MetaData()
 _users_table: Optional[Table] = None
 
 
 def get_users_table() -> Table:
+    """Ленивое отражение таблицы users (не шьём схему в код)."""
     global _users_table
     if _users_table is not None:
         return _users_table
-
-    # Пытаемся сначала со схемой public, потом без схемы (на всякий)
     try:
         _metadata.clear()
         _users_table = Table("users", _metadata, autoload_with=engine, schema="public")
-        return _users_table
     except Exception:
         _metadata.clear()
         _users_table = Table("users", _metadata, autoload_with=engine)
-        return _users_table
+    return _users_table
 
 
-def ensure_user(chat_id: int) -> Dict[str, Any]:
+def upsert_user_from_tg(update: Update) -> Dict[str, Any]:
     """
-    Находит пользователя по chat_id. Если нет — создаёт минимальную запись.
-    Ничего в схеме не предполагаем жёстко: используем только существующие поля.
+    Приводим БД в актуальное состояние под схему:
+    chat_id BIGINT not null, tg_id BIGINT not null, username, first_name, last_name,
+    free_drinks INT default 0, favorite_drinks JSONB default [].
     """
+    chat = update.effective_chat
+    if not chat:
+        return {}
+
+    chat_id = int(chat.id)
+    tg_id = int(getattr(update.effective_user, "id", chat_id) or chat_id)
+    username = getattr(update.effective_user, "username", None)
+    first_name = getattr(update.effective_user, "first_name", None)
+    last_name = getattr(update.effective_user, "last_name", None)
+
     users = get_users_table()
-    cols = {c.name for c in users.columns}
-
     with engine.begin() as conn:
-        # ищем по chat_id
-        if "chat_id" in cols:
-            row = conn.execute(text("SELECT * FROM users WHERE chat_id = :cid LIMIT 1"), {"cid": chat_id}).mappings().first()
-        else:
-            row = None
+        # ищем по chat_id (основной ключ), если вдруг нет — по tg_id
+        row = conn.execute(
+            text("SELECT * FROM users WHERE chat_id = :cid LIMIT 1"),
+            {"cid": chat_id},
+        ).mappings().first()
+        if not row:
+            row = conn.execute(
+                text("SELECT * FROM users WHERE tg_id = :tid LIMIT 1"),
+                {"tid": tg_id},
+            ).mappings().first()
 
         if row:
+            # обновляем tg-поля и updated_at
+            conn.execute(
+                text(
+                    """
+                    UPDATE users
+                       SET tg_id      = :tg_id,
+                           username   = :username,
+                           first_name = :first_name,
+                           last_name  = :last_name,
+                           updated_at = now()
+                     WHERE chat_id    = :chat_id
+                    """
+                ),
+                {
+                    "tg_id": tg_id,
+                    "username": username,
+                    "first_name": first_name,
+                    "last_name": last_name,
+                    "chat_id": row["chat_id"],  # уже существующий chat_id
+                },
+            )
+            # перечитываем
+            row = conn.execute(
+                text("SELECT * FROM users WHERE chat_id = :cid LIMIT 1"),
+                {"cid": row["chat_id"]},
+            ).mappings().first()
             return dict(row)
 
-        # если нет записи, пробуем вставить, только если есть поле chat_id
-        if "chat_id" in cols:
-            insert_sql = "INSERT INTO users (chat_id) VALUES (:cid) RETURNING *"
-            row = conn.execute(text(insert_sql), {"cid": chat_id}).mappings().first()
-            return dict(row) if row else {}
-        # если таблица без chat_id — ничего не делаем
-        return {}
+        # не нашли — создаём корректную запись
+        row = conn.execute(
+            text(
+                """
+                INSERT INTO users (chat_id, tg_id, username, first_name, last_name)
+                VALUES (:chat_id, :tg_id, :username, :first_name, :last_name)
+                RETURNING *
+                """
+            ),
+            {
+                "chat_id": chat_id,
+                "tg_id": tg_id,
+                "username": username,
+                "first_name": first_name,
+                "last_name": last_name,
+            },
+        ).mappings().first()
+        return dict(row) if row else {}
 
 
 # ---------------------------
@@ -110,22 +150,27 @@ if OPENAI_API_KEY:
 
 
 async def ask_openai(text_in: str, user_row: Dict[str, Any]) -> str:
-    """
-    Все диалоги только через OpenAI. Если не доступен — фиксированная заглушка.
-    Никаких эхо.
-    """
     if not openai_client:
         return OPENAI_FALLBACK
 
-    # Подготавливаем простейший профиль из БД (если есть нужные поля)
+    # Собираем «память» из БД
     name = user_row.get("name") or user_row.get("first_name") or ""
-    age = user_row.get("age")
-    persona = "Ты дружелюбная собутыльница Катя. Отвечай кратко и по-доброму, на русском."
+    summary = (user_row.get("summary") or "").strip()
+    favs = user_row.get("favorite_drinks")
+    try:
+        favs_str = ""
+        if isinstance(favs, list) and favs:
+            favs_str = " Любимые напитки: " + ", ".join(map(str, favs)) + "."
+    except Exception:
+        favs_str = ""
 
+    persona = "Ты дружелюбная собутыльница Катя. Отвечай кратко и по-доброму, на русском."
     if name:
         persona += f" Собеседника зовут {name}."
-    if age:
-        persona += f" Ему {age} лет."
+    if summary:
+        persona += f" Краткая инфа о нём: {summary}."
+    if favs_str:
+        persona += favs_str
 
     try:
         resp = openai_client.chat.completions.create(
@@ -151,9 +196,7 @@ telegram_app: Optional[Application] = None
 def mask_token(tok: str) -> str:
     if not tok:
         return "<empty>"
-    if len(tok) <= 10:
-        return "***" + tok[-4:]
-    return tok[:6] + "..." + tok[-6:]
+    return tok[:6] + "..." + tok[-6:] if len(tok) > 12 else "***" + tok[-4:]
 
 
 def build_telegram_app() -> Application:
@@ -163,27 +206,27 @@ def build_telegram_app() -> Application:
 
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-    # никаких эхо/тестовых хендлеров
     return app
 
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        chat_id = update.effective_chat.id
-        ensure_user(chat_id)
-        await update.message.reply_text("Привет! Я Катя 🍸 Готова поболтать.")
+        row = upsert_user_from_tg(update)
+        name = row.get("name") or row.get("first_name") or ""
+        hi = f"Привет, {name}! " if name else "Привет! "
+        await update.message.reply_text(hi + "Я Катя 🍸 Готова поболтать.")
     except Exception as e:
         logger.error("start_handler error: %s", e)
+        await update.message.reply_text(OPENAI_FALLBACK)
 
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if not update.message or not update.message.text:
             return
-        chat_id = update.effective_chat.id
-        user_row = ensure_user(chat_id)
+        row = upsert_user_from_tg(update)
         user_text = update.message.text.strip()
-        answer = await ask_openai(user_text, user_row)
+        answer = await ask_openai(user_text, row)
         await update.message.reply_text(answer)
     except Exception as e:
         logger.error("text_handler error: %s", e)
@@ -193,7 +236,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------
 # FastAPI app
 # ---------------------------
-app = FastAPI(title="Drinking Buddy Bot", version="1.0.0")
+app = FastAPI(title="Drinking Buddy Bot", version="1.1.0")
 
 
 @app.get("/")
@@ -208,7 +251,7 @@ def root() -> Dict[str, Any]:
 
 @app.on_event("startup")
 async def on_startup():
-    # проверим базу
+    # DB ping
     try:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
@@ -224,10 +267,8 @@ async def on_startup():
         return
 
     telegram_app = build_telegram_app()
-    # для работы process_update требуется initialize()
     await telegram_app.initialize()
 
-    # Вебхук выставляем только если явно разрешено и известен base URL
     if AUTO_SET_WEBHOOK and APP_BASE_URL:
         url = f"{APP_BASE_URL}/webhook/{BOT_TOKEN}"
         try:
@@ -257,9 +298,7 @@ async def telegram_webhook(token: str, request: Request):
     if not BOT_TOKEN:
         return Response(status_code=403, content="BOT_TOKEN not set")
     if token != BOT_TOKEN:
-        # защищаемся от чужих/старых токенов
         return Response(status_code=403, content="wrong token")
-
     if not telegram_app:
         return Response(status_code=503, content="telegram app not ready")
 
@@ -274,19 +313,16 @@ async def telegram_webhook(token: str, request: Request):
 
 
 # ---------------------------
-# DEBUG: СХЕМА БАЗЫ
+# DEBUG ЭНДПОИНТЫ
 # ---------------------------
 @app.get("/debug/users-schema")
 def debug_users_schema():
-    """Возвращает структуру таблицы users (колонки, типы, nullable, default)."""
     try:
         insp = inspect(engine)
-        # пробуем со схемой public, если нет — без схемы
         try:
             cols = insp.get_columns("users", schema="public")
         except Exception:
             cols = insp.get_columns("users")
-
         out = []
         for c in cols:
             out.append(
@@ -300,4 +336,23 @@ def debug_users_schema():
         return {"users": out}
     except Exception as e:
         logger.error("/debug/users-schema error: %s", e)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/debug/user")
+def debug_user(chat_id: int = Query(..., description="Telegram chat_id")):
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT * FROM users WHERE chat_id = :cid LIMIT 1"),
+                {"cid": chat_id},
+            ).mappings().first()
+            if not row:
+                row = conn.execute(
+                    text("SELECT * FROM users WHERE tg_id = :cid LIMIT 1"),
+                    {"cid": chat_id},
+                ).mappings().first()
+        return {"user": dict(row) if row else None}
+    except Exception as e:
+        logger.error("/debug/user error: %s", e)
         return JSONResponse({"error": str(e)}, status_code=500)
