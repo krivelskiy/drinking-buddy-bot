@@ -1,246 +1,305 @@
-import os
+import asyncio
 import json
 import logging
-from typing import Optional
+import os
+from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import PlainTextResponse
-from pydantic import BaseModel
-
+import httpx
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.responses import PlainTextResponse, JSONResponse
+from openai import OpenAI
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
-from telegram import Update
-from telegram.ext import Application, ApplicationBuilder, CommandHandler, MessageHandler, filters
-
-from httpx import HTTPError
-
-# ==== наши константы (единая точка правды) ====
+# ВАЖНО: всё, что связано со схемой и именами полей, берём только из constants
 from constants import STICKERS, DRINK_KEYWORDS, DB_FIELDS, FALLBACK_OPENAI_UNAVAILABLE
 
-# ---------- ЛОГИ ----------
-logger = logging.getLogger("app")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
-
-# ---------- ENV ----------
+# ------- конфиг ключей (строго по договорённостям)
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-APP_BASE_URL = os.getenv("APP_BASE_URL", "").strip()
-AUTO_SET_WEBHOOK = os.getenv("AUTO_SET_WEBHOOK", "true").strip().lower() in ("1", "true", "yes", "y")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+BASE_URL = os.getenv("BASE_URL", os.getenv("RENDER_EXTERNAL_URL", "")).rstrip("/")
 
-if not DATABASE_URL:
-    logger.warning("DATABASE_URL is empty — persistence will fail")
+# ------- логирование
+logger = logging.getLogger("app")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
-if not BOT_TOKEN:
-    logger.error("BOT_TOKEN is empty — Telegram бот работать не будет")
+# ------- FastAPI app (обязательно app)
+app = FastAPI(title="Drinking Buddy Bot", version="1.0.1")
 
-if not OPENAI_API_KEY:
-    logger.warning("OPENAI_API_KEY is empty — включится fallback-ответ (без диалога)")
+# =========================================
+# DB
+# =========================================
+_engine: Optional[Engine] = None
 
-# ---------- БД ----------
-engine: Optional[Engine] = None
 
-def init_db() -> Engine:
-    global engine
-    if engine:
-        return engine
-    engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
-    logger.info("✅ Database initialized")
-    return engine
+def _init_db_engine() -> Engine:
+    if not DATABASE_URL:
+        logger.warning("DATABASE_URL is empty — DB features will be disabled")
+    eng = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=1800)
+    return eng
 
-# простейший upsert пользователя (без требований к unique индексам)
-async def upsert_user(update: Update) -> None:
-    if not engine:
+
+def db_exec(sql: str, **params):
+    global _engine
+    if _engine is None:
+        _engine = _init_db_engine()
+        logger.info("✅ Database initialized")
+    with _engine.begin() as conn:
+        return conn.execute(text(sql), params)
+
+
+def upsert_user_from_update(message: Dict[str, Any]) -> None:
+    """Создаёт/обновляет пользователя по incoming message (имена полей из DB_FIELDS)."""
+    if not DATABASE_URL:
         return
-    u_tbl = DB_FIELDS["users"]
-    msg = update.effective_message
-    user = update.effective_user
 
-    chat_id = update.effective_chat.id if update.effective_chat else None
-    if chat_id is None or user is None:
+    users = DB_FIELDS["users"]  # Имена колонок берём только из constants
+    chat = message.get("chat") or {}
+    user = message.get("from") or {}
+
+    chat_id = chat.get("id")
+    tg_id = user.get("id")
+    username = user.get("username")
+    first_name = user.get("first_name")
+    last_name = user.get("last_name")
+
+    if chat_id is None or tg_id is None:
         return
 
-    payload = {
-        u_tbl["pk"]: chat_id,
-        u_tbl["tg_id"]: user.id,
-        u_tbl["username"]: user.username,
-        u_tbl["first_name"]: user.first_name,
-        u_tbl["last_name"]: user.last_name,
-        u_tbl["name"]: (user.full_name or "").strip() if hasattr(user, "full_name") else None,
+    sql = f"""
+    INSERT INTO users ({users['pk']}, {users['tg_id']}, {users['username']}, {users['first_name']}, {users['last_name']})
+    VALUES (:chat_id, :tg_id, :username, :first_name, :last_name)
+    ON CONFLICT ({users['pk']}) DO UPDATE SET
+        {users['tg_id']} = EXCLUDED.{users['tg_id']},
+        {users['username']} = EXCLUDED.{users['username']},
+        {users['first_name']} = EXCLUDED.{users['first_name']},
+        {users['last_name']} = EXCLUDED.{users['last_name']},
+        {users['updated_at']} = now();
+    """
+    db_exec(
+        sql,
+        chat_id=chat_id,
+        tg_id=tg_id,
+        username=username,
+        first_name=first_name,
+        last_name=last_name,
+    )
+
+
+def load_user_context(chat_id: int) -> Dict[str, Any]:
+    """Возвращает summary/favorite_drinks/name как контекст (имена полей из DB_FIELDS)."""
+    if not DATABASE_URL:
+        return {}
+    users = DB_FIELDS["users"]
+    sql = f"""
+        SELECT {users['summary']} AS summary,
+               {users['favorite_drinks']} AS favorite_drinks,
+               {users['name']} AS name
+        FROM users
+        WHERE {users['pk']} = :chat_id
+    """
+    row = db_exec(sql, chat_id=chat_id).mappings().first()
+    if not row:
+        return {}
+    return {
+        "summary": row.get("summary"),
+        "favorite_drinks": row.get("favorite_drinks") or [],
+        "name": row.get("name"),
     }
 
-    # SELECT существует ли запись по chat_id
-    sel_sql = text(f"""
-        SELECT 1 FROM users WHERE {u_tbl['pk']} = :chat_id LIMIT 1
-    """)
-    # INSERT / UPDATE
-    ins_sql = text(f"""
-        INSERT INTO users ({u_tbl['pk']}, {u_tbl['tg_id']}, {u_tbl['username']},
-                           {u_tbl['first_name']}, {u_tbl['last_name']}, {u_tbl['name']})
-        VALUES (:{u_tbl['pk']}, :{u_tbl['tg_id']}, :{u_tbl['username']},
-                :{u_tbl['first_name']}, :{u_tbl['last_name']}, :{u_tbl['name']})
-    """)
-    upd_sql = text(f"""
-        UPDATE users
-           SET {u_tbl['tg_id']} = :{u_tbl['tg_id']},
-               {u_tbl['username']} = :{u_tbl['username']},
-               {u_tbl['first_name']} = :{u_tbl['first_name']},
-               {u_tbl['last_name']} = :{u_tbl['last_name']},
-               {u_tbl['name']} = :{u_tbl['name']},
-               {u_tbl['updated_at']} = now()
-         WHERE {u_tbl['pk']} = :{u_tbl['pk']}
-    """)
 
-    with engine.begin() as conn:
-        exists = conn.execute(sel_sql, {"chat_id": chat_id}).first() is not None
-        if exists:
-            conn.execute(upd_sql, payload)
+# =========================================
+# Telegram API (без PTB)
+# =========================================
+TG_API = "https://api.telegram.org"
+
+
+async def tg_send_text(chat_id: int, text: str) -> None:
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN is empty — cannot send messages")
+        return
+    url = f"{TG_API}/bot{BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text}
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(url, json=payload)
+        if r.status_code != 200:
+            logger.error("sendMessage failed: %s %s", r.status_code, r.text)
+
+
+async def tg_send_sticker(chat_id: int, sticker_id: str) -> None:
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN is empty — cannot send stickers")
+        return
+    url = f"{TG_API}/bot{BOT_TOKEN}/sendSticker"
+    payload = {"chat_id": chat_id, "sticker": sticker_id}
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(url, json=payload)
+        if r.status_code != 200:
+            logger.error("sendSticker failed: %s %s", r.status_code, r.text)
+
+
+async def tg_set_webhook() -> None:
+    if not (BOT_TOKEN and BASE_URL):
+        if not BOT_TOKEN:
+            logger.warning("BOT_TOKEN is empty (webhook работать не будет)")
+        if not BASE_URL:
+            logger.warning("BASE_URL is empty (webhook не будет выставлен)")
+        return
+    url = f"{TG_API}/bot{BOT_TOKEN}/setWebhook"
+    webhook_url = f"{BASE_URL}/webhook/{BOT_TOKEN}"
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(url, json={"url": webhook_url})
+        if r.status_code == 200:
+            logger.info("✅ Webhook set to %s", webhook_url)
         else:
-            conn.execute(ins_sql, payload)
+            logger.error("setWebhook failed: %s %s", r.status_code, r.text)
 
-# ---------- OpenAI (безопасная обёртка) ----------
-# Важно: ВСЕ диалоги — только через OpenAI; если ключа нет/ошибка — отвечаем заглушкой.
-def generate_reply_via_openai(prompt: str) -> Optional[str]:
+
+# =========================================
+# OpenAI
+# =========================================
+def build_openai_client() -> Optional[OpenAI]:
     if not OPENAI_API_KEY:
+        logger.warning("OPENAI_API_KEY is empty — conversations will use fallback")
         return None
     try:
-        # ленивый импорт чтобы не тянуть при отсутствии ключа
-        from openai import OpenAI
         client = OpenAI(api_key=OPENAI_API_KEY)
-        # очень компактный системный промпт — держим как было ранее
-        system = (
-            "Ты — весёлая собутыльница Катя. Отвечай коротко, дружелюбно, по-русски. "
-            "Не обсуждай политику, не давай медицинских/юридических советов."
-        )
-        resp = client.chat.completions.create(
+        logger.info("✅ OpenAI client initialized")
+        return client
+    except Exception as e:
+        logger.exception("OpenAI init failed: %s", e)
+        return None
+
+
+_openai_client: Optional[OpenAI] = None
+
+
+async def ai_reply(user_text: str, user_ctx: Dict[str, Any]) -> Optional[str]:
+    """Все диалоги только через OpenAI. При сбое — вернём None (отправим заглушку)."""
+    global _openai_client
+    if _openai_client is None:
+        _openai_client = build_openai_client()
+    if _openai_client is None:
+        return None
+
+    summary = (user_ctx.get("summary") or "").strip()
+    fav = user_ctx.get("favorite_drinks") or []
+    name = (user_ctx.get("name") or "").strip()
+
+    sys_parts = [
+        "Ты — Катя Собутыльница: дружелюбная, остроумная, позитивная.",
+        "Отвечай коротко и по делу, с лёгкой иронией. Не повторяй сообщения пользователя.",
+        "Если собеседник спросит факты о себе — используй контекст из БД, если он есть.",
+        "Никаких платёжных сценариев сейчас не запускай.",
+    ]
+    if name:
+        sys_parts.append(f"Имя собеседника: {name}.")
+    if summary:
+        sys_parts.append(f"Краткое описание собеседника: {summary}.")
+    if fav:
+        sys_parts.append(f"Любимые напитки собеседника: {', '.join(map(str, fav))}.")
+
+    system_prompt = " ".join(sys_parts)
+
+    try:
+        resp = _openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_text},
             ],
-            temperature=0.8,
-            max_tokens=200,
+            temperature=0.7,
         )
-        return resp.choices[0].message.content.strip()
+        return (resp.choices[0].message.content or "").strip()
     except Exception as e:
-        logger.warning("OpenAI error: %s", e)
+        logger.exception("OpenAI error: %s", e)
         return None
 
-# ---------- Telegram ----------
-tapp: Optional[Application] = None
 
-def build_telegram_app() -> Application:
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is not set")
+# =========================================
+# Startup
+# =========================================
+@app.on_event("startup")
+async def on_startup():
+    if DATABASE_URL:
+        global _engine
+        _engine = _init_db_engine()
+    else:
+        logger.warning("DATABASE_URL is empty (DB features disabled)")
+    await tg_set_webhook()
 
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # /start
-    async def start_cmd(update: Update, context):
-        await upsert_user(update)
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="Привет! Я Катя 🍷 Что пьём?")
-
-    # текстовые сообщения
-    async def text_handler(update: Update, context):
-        await upsert_user(update)
-        text_in = (update.effective_message.text or "").strip()
-        # 1) если увидели напиток — отправим соответствующий стикер
-        if text_in:
-            low = text_in.lower()
-            chosen_key = None
-            for kw, sticker_key in DRINK_KEYWORDS.items():
-                if kw in low:
-                    chosen_key = sticker_key
-                    break
-            if chosen_key:
-                sticker_id = STICKERS[chosen_key]
-                try:
-                    await context.bot.send_sticker(update.effective_chat.id, sticker_id)
-                except Exception as e:
-                    logger.warning("Sticker send failed: %s", e)
-
-        # 2) все ответы — через OpenAI (или заглушка, если недоступен)
-        reply = generate_reply_via_openai(text_in)
-        if reply is None:
-            # Не продолжаем диалог, только отдадим фиксированную фразу
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=FALLBACK_OPENAI_UNAVAILABLE)
-            return
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=reply)
-
-    application.add_handler(CommandHandler("start", start_cmd))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-    return application
-
-async def ensure_webhook(app: Application) -> None:
-    if not AUTO_SET_WEBHOOK:
-        return
-    if not APP_BASE_URL:
-        logger.warning("APP_BASE_URL is empty — webhook не будет установлен автоматически")
-        return
-    url = f"{APP_BASE_URL.rstrip('/')}/webhook/{BOT_TOKEN}"
-    try:
-        await app.bot.set_webhook(url)
-        logger.info("✅ Webhook set to %s", url)
-    except HTTPError as e:
-        logger.error("Failed to set webhook: %s", e)
-
-# ---------- FastAPI ----------
-api = FastAPI()
-
-class TelegramUpdate(BaseModel):
-    update_id: int | None = None
-
-@api.get("/", response_class=PlainTextResponse)
+# =========================================
+# Routes
+# =========================================
+@app.get("/", response_class=PlainTextResponse)
 async def root():
     return "OK"
 
-@api.get("/health", response_class=PlainTextResponse)
+
+@app.get("/health", response_class=PlainTextResponse)
 async def health():
     return "healthy"
 
-@api.on_event("startup")
-async def on_startup():
-    try:
-        init_db()
-        global tapp
-        tapp = build_telegram_app()
-        # важно: инициализируем аппу, чтобы потом можно было process_update()
-        await tapp.initialize()
-        await ensure_webhook(tapp)
-        logger.info("✅ Telegram application is ready")
-    except Exception as e:
-        logger.error("Startup failed: %s", e)
 
-@api.on_event("shutdown")
-async def on_shutdown():
-    global tapp
-    if tapp:
-        try:
-            await tapp.shutdown()
-            await tapp.stop()
-        except Exception:
-            pass
+@app.get("/db/schema", response_class=JSONResponse)
+async def db_schema():
+    """
+    Возвращаем структуру ТОЛЬКО из constants.DB_FIELDS,
+    без хардкода типов/названий в приложении.
+    """
+    return {"db_fields": DB_FIELDS}
 
-@api.post("/webhook/{token}")
+
+@app.post("/webhook/{token}")
 async def telegram_webhook(token: str, request: Request):
-    if token != BOT_TOKEN:
-        raise HTTPException(status_code=403, detail="Forbidden")
+    """
+    Принимаем апдейты Telegram.
+    Требуем строгого совпадения token в пути с BOT_TOKEN — иначе 403.
+    """
+    if not BOT_TOKEN or token != BOT_TOKEN:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="wrong token in path")
 
-    body = await request.body()
+    payload = await request.json()
+    logger.info("Incoming update: %s", payload.get("update_id"))
+
+    message = payload.get("message") or payload.get("edited_message")
+    if not message:
+        return {"ok": True}
+
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+    if chat_id is None:
+        return {"ok": True}
+
+    text = (message.get("text") or "").strip()
+
+    # 1) апсертим пользователя (имена колонок из constants)
     try:
-        data = json.loads(body.decode("utf-8"))
-    except Exception:
-        data = {}
+        upsert_user_from_update(message)
+    except Exception as e:
+        logger.exception("User upsert failed: %s", e)
 
-    # Принимаем update и передаём в PTB
-    global tapp
-    if not tapp:
-        raise HTTPException(status_code=500, detail="Bot is not initialized")
+    # 2) распознаём напиток — отправляем стикер из constants.STICKERS
+    lowered = text.lower()
+    for kw, sticker_key in DRINK_KEYWORDS.items():
+        if kw in lowered:
+            sticker_id = STICKERS[sticker_key]
+            await tg_send_sticker(chat_id, sticker_id)
+            break
 
-    update = Update.de_json(data, tapp.bot)
-    await tapp.process_update(update)
-    return PlainTextResponse("OK")
+    # 3) отвечаем ТОЛЬКО через OpenAI; при ошибке — заглушка и без продолжения
+    user_ctx = {}
+    try:
+        user_ctx = load_user_context(chat_id)
+    except Exception as e:
+        logger.exception("load_user_context failed: %s", e)
+
+    reply = await ai_reply(text, user_ctx)
+    if reply is None:
+        await tg_send_text(chat_id, FALLBACK_OPENAI_UNAVAILABLE)
+        return {"ok": True}
+
+    await tg_send_text(chat_id, reply)
+    return {"ok": True}
