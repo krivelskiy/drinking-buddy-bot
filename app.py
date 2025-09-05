@@ -73,10 +73,28 @@ def init_db():
         
         # Добавляем недостающие колонки к существующим таблицам
         try:
+            # Добавляем колонку user_tg_id к users если её нет
+            conn.execute(DDL(f"""
+                ALTER TABLE {USERS_TABLE} 
+                ADD COLUMN IF NOT EXISTS user_tg_id BIGINT UNIQUE
+            """))
+        except Exception:
+            pass  # Колонка уже существует
+            
+        try:
             # Добавляем колонку age к users если её нет
             conn.execute(DDL(f"""
                 ALTER TABLE {USERS_TABLE} 
                 ADD COLUMN IF NOT EXISTS age INTEGER
+            """))
+        except Exception:
+            pass  # Колонка уже существует
+            
+        try:
+            # Добавляем колонку user_tg_id к messages если её нет
+            conn.execute(DDL(f"""
+                ALTER TABLE {MESSAGES_TABLE} 
+                ADD COLUMN IF NOT EXISTS user_tg_id BIGINT NOT NULL DEFAULT 0
             """))
         except Exception:
             pass  # Колонка уже существует
