@@ -230,7 +230,9 @@ def get_user_age(user_tg_id: int) -> Optional[int]:
             text(f"SELECT {U['age']} FROM {USERS_TABLE} WHERE {U['user_tg_id']} = :tg_id"),
             {"tg_id": user_tg_id},
         ).fetchone()
-        return row[0] if row and row[0] else None
+        age = row[0] if row and row[0] else None
+        logger.info(f"Retrieved age for user {user_tg_id}: {age}")
+        return age
 
 def update_user_age(user_tg_id: int, age: int) -> None:
     """Обновление возраста пользователя в БД"""
@@ -243,6 +245,7 @@ def update_user_age(user_tg_id: int, age: int) -> None:
             """),
             {"tg_id": user_tg_id, "age": age},
         )
+        logger.info(f"Updated age for user {user_tg_id} to {age}")
 
 def get_recent_messages(chat_id: int, limit: int = 10) -> list:
     """Получение последних сообщений для контекста"""
@@ -276,6 +279,7 @@ def parse_age_from_text(text: str) -> Optional[int]:
             try:
                 age = int(match.group(1))
                 if 1 <= age <= 150:  # разумные границы возраста
+                    logger.info(f"Parsed age from text '{text}': {age}")
                     return age
             except ValueError:
                 continue
@@ -313,12 +317,10 @@ def load_context() -> str:
     try:
         with open("Context.txt", "r", encoding="utf-8") as f:
             content = f.read().strip()
-            # Убираем первую строку с инструкциями для разработчика
-            lines = content.split('\n')
-            if lines[0].startswith('Это файл с правилами разработки'):
-                content = '\n'.join(lines[1:]).strip()
+            logger.info(f"Loaded context: {content[:100]}...")
             return content
-    except Exception:
+    except Exception as e:
+        logger.exception("Failed to load context from Context.txt")
         return "Ты — Катя Собутыльница: живая девушка, дружелюбная, немного флиртуешь, любишь пошутить и выпить. Ты любишь алкогольные напитки и всегда готова поддержать компанию за рюмочку. Отвечай коротко и по делу, как живой человек. Если пользователь предлагает выпить или упоминает алкоголь - ты всегда соглашаешься и радуешься."
 
 SYSTEM_PROMPT = load_context()
@@ -349,6 +351,8 @@ async def llm_reply(user_text: str, username: Optional[str], user_tg_id: int, ch
             messages.append(msg)
         
         messages.append({"role": "user", "content": user_text})
+        
+        logger.info(f"LLM request for user {user_tg_id}: {len(messages)} messages, age: {user_age}")
 
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
