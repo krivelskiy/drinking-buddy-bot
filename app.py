@@ -1,6 +1,8 @@
 import os
+import re
+import random
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from fastapi import FastAPI, Request, Response, Query
 from fastapi.responses import JSONResponse
@@ -30,6 +32,25 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 OPENAI_FALLBACK = "Извини, у меня временные неполадки с мозгами 🤖. Попробуй позже."
 
 # ---------------------------
+# СТИКЕРЫ — ХРАНИМ В КОДЕ (НЕ УДАЛЯТЬ)
+# ---------------------------
+# 1. Катя весёлая
+STICKER_KATYA_HAPPY = "CAACAgIAAxkBAAEBjrpouGAERwa1uHIJiB5lkhQZps-j_wACcoEAAlGlwEnCOTC-IwMCBDYE"
+# 2. Катя грустная
+STICKER_KATYA_SAD = "CAACAgIAAxkBAAEBjrxouGAyqkcwuIJiCaINHEu-QVn4NAAC1IAAAhynyUnZmmKvP768xzYE"
+# 3. Катя пьёт водку
+STICKER_VODKA = "CAACAgIAAxkBAAEBjr5ouGBBx_1-DTY7HwkdW3rQWOcgRAACsIAAAiFbyEn_G4lgoMu7IjYE"
+# 4. Катя пьёт виски
+STICKER_WHISKY = "CAACAgIAAxkBAAEBjsBouGBSGJX2UPfsKzHTIYlfD7eAswACDH8AAnEbyEnqwlOYBHZL3jYE"
+# 5. Катя пьёт вино
+STICKER_WINE = "CAACAgIAAxkBAAEBjsJouGBk6eEZ60zhrlVYxtaa6o1IpwACzoEAApg_wUm0xElTR8mU3zYE"
+# 6. Катя пьёт пиво
+STICKER_BEER = "CAACAgIAAxkBAAEBjsRouGBy8fdkWj0MhodvqLl3eT9fcgACX4cAAvmhwElmpyDuoHw7IjYE"
+
+# Набор «напиточных» для случайной реакции, когда тип не указан
+DRINK_STICKER_POOL: List[str] = [STICKER_VODKA, STICKER_WHISKY, STICKER_WINE, STICKER_BEER]
+
+# ---------------------------
 # БАЗА ДАННЫХ
 # ---------------------------
 def build_engine() -> Engine:
@@ -44,7 +65,7 @@ _users_table: Optional[Table] = None
 
 
 def get_users_table() -> Table:
-    """Ленивое отражение таблицы users (не шьём схему в код)."""
+    """Ленивое отражение таблицы users (чтобы не хардкодить схему)."""
     global _users_table
     if _users_table is not None:
         return _users_table
@@ -59,7 +80,7 @@ def get_users_table() -> Table:
 
 def upsert_user_from_tg(update: Update) -> Dict[str, Any]:
     """
-    Приводим БД в актуальное состояние под схему:
+    Поддерживаем схему из твоей БД:
     chat_id BIGINT not null, tg_id BIGINT not null, username, first_name, last_name,
     free_drinks INT default 0, favorite_drinks JSONB default [].
     """
@@ -75,7 +96,6 @@ def upsert_user_from_tg(update: Update) -> Dict[str, Any]:
 
     users = get_users_table()
     with engine.begin() as conn:
-        # ищем по chat_id (основной ключ), если вдруг нет — по tg_id
         row = conn.execute(
             text("SELECT * FROM users WHERE chat_id = :cid LIMIT 1"),
             {"cid": chat_id},
@@ -87,7 +107,6 @@ def upsert_user_from_tg(update: Update) -> Dict[str, Any]:
             ).mappings().first()
 
         if row:
-            # обновляем tg-поля и updated_at
             conn.execute(
                 text(
                     """
@@ -105,17 +124,16 @@ def upsert_user_from_tg(update: Update) -> Dict[str, Any]:
                     "username": username,
                     "first_name": first_name,
                     "last_name": last_name,
-                    "chat_id": row["chat_id"],  # уже существующий chat_id
+                    "chat_id": row["chat_id"],
                 },
             )
-            # перечитываем
             row = conn.execute(
                 text("SELECT * FROM users WHERE chat_id = :cid LIMIT 1"),
                 {"cid": row["chat_id"]},
             ).mappings().first()
             return dict(row)
 
-        # не нашли — создаём корректную запись
+        # не нашли — создаём запись
         row = conn.execute(
             text(
                 """
@@ -153,16 +171,16 @@ async def ask_openai(text_in: str, user_row: Dict[str, Any]) -> str:
     if not openai_client:
         return OPENAI_FALLBACK
 
-    # Собираем «память» из БД
     name = user_row.get("name") or user_row.get("first_name") or ""
     summary = (user_row.get("summary") or "").strip()
     favs = user_row.get("favorite_drinks")
+
+    favs_str = ""
     try:
-        favs_str = ""
         if isinstance(favs, list) and favs:
             favs_str = " Любимые напитки: " + ", ".join(map(str, favs)) + "."
     except Exception:
-        favs_str = ""
+        pass
 
     persona = "Ты дружелюбная собутыльница Катя. Отвечай кратко и по-доброму, на русском."
     if name:
@@ -209,12 +227,67 @@ def build_telegram_app() -> Application:
     return app
 
 
+# --- РАСПОЗНАВАНИЕ «ВЫПИТЬ» И НАПИТКА ---
+# Общее «выпей/налей/...»
+GENERIC_DRINK_RE = re.compile(
+    r"\b(пей|выпей|выпьем|наливай|налей|накатим|шот|шоты|по\s*рюмке|давай\s*выпьем|бухн)\b",
+    re.IGNORECASE,
+)
+
+# Конкретные напитки
+VODKA_RE = re.compile(r"\b(водк[аиуые]|vodka)\b", re.IGNORECASE)
+WHISKY_RE = re.compile(r"\b(виск[иий]|whisk(?:y|ey))\b", re.IGNORECASE)
+WINE_RE = re.compile(r"\b(вин[оаеиы]|винц[оа]|wine)\b", re.IGNORECASE)
+BEER_RE = re.compile(r"\b(пив[оаеиы]|по\s*пив[уо]|beer|lager|ale)\b", re.IGNORECASE)
+
+async def send_drink_sticker_by_type(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, text_in: str
+) -> bool:
+    """
+    Определяем напиток по тексту и отправляем соответствующий стикер.
+    Возвращает True, если что-то отправили.
+    """
+    chat_id = update.effective_chat.id
+    try:
+        if VODKA_RE.search(text_in):
+            await context.bot.send_sticker(chat_id=chat_id, sticker=STICKER_VODKA)
+            return True
+        if WHISKY_RE.search(text_in):
+            await context.bot.send_sticker(chat_id=chat_id, sticker=STICKER_WHISKY)
+            return True
+        if WINE_RE.search(text_in):
+            await context.bot.send_sticker(chat_id=chat_id, sticker=STICKER_WINE)
+            return True
+        if BEER_RE.search(text_in):
+            await context.bot.send_sticker(chat_id=chat_id, sticker=STICKER_BEER)
+            return True
+        if GENERIC_DRINK_RE.search(text_in):
+            await context.bot.send_sticker(chat_id=chat_id, sticker=random.choice(DRINK_STICKER_POOL))
+            return True
+        return False
+    except Exception as e:
+        logger.warning("send_drink_sticker_by_type failed: %s", e)
+        try:
+            # хотя бы эмодзи, чтобы не молчать
+            await context.bot.send_message(chat_id=chat_id, text="🍺 ик!")
+            return True
+        except Exception:
+            return False
+
+
+# --- Handlers ---
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         row = upsert_user_from_tg(update)
         name = row.get("name") or row.get("first_name") or ""
         hi = f"Привет, {name}! " if name else "Привет! "
         await update.message.reply_text(hi + "Я Катя 🍸 Готова поболтать.")
+        # милый старт — иногда шлём «весёлую Катю»
+        try:
+            if random.random() < 0.25:
+                await context.bot.send_sticker(chat_id=update.effective_chat.id, sticker=STICKER_KATYA_HAPPY)
+        except Exception:
+            pass
     except Exception as e:
         logger.error("start_handler error: %s", e)
         await update.message.reply_text(OPENAI_FALLBACK)
@@ -224,8 +297,15 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if not update.message or not update.message.text:
             return
-        row = upsert_user_from_tg(update)
         user_text = update.message.text.strip()
+
+        # сохраняем/обновляем пользователя
+        row = upsert_user_from_tg(update)
+
+        # Если просили выпить — отправим подходящий стикер (до ответа модели)
+        await send_drink_sticker_by_type(update, context, user_text)
+
+        # Диалог всегда через OpenAI; если он недоступен — вернём заглушку
         answer = await ask_openai(user_text, row)
         await update.message.reply_text(answer)
     except Exception as e:
@@ -236,7 +316,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------
 # FastAPI app
 # ---------------------------
-app = FastAPI(title="Drinking Buddy Bot", version="1.1.0")
+app = FastAPI(title="Drinking Buddy Bot", version="1.3.0")
 
 
 @app.get("/")
@@ -246,6 +326,8 @@ def root() -> Dict[str, Any]:
         "webhook_expected": bool(BOT_TOKEN and APP_BASE_URL),
         "auto_set_webhook": AUTO_SET_WEBHOOK,
         "bot_token_masked": mask_token(BOT_TOKEN),
+        "has_drink_stickers": True,
+        "version": "1.3.0",
     }
 
 
