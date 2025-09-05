@@ -1,303 +1,303 @@
 import os
-import json
-import asyncio
 import logging
-from typing import Any, Dict, Optional, List
+from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, Request, Response, status
-from fastapi.responses import PlainTextResponse
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse, PlainTextResponse
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, inspect, MetaData, Table
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
 
 from telegram import Update
-from telegram.ext import (
-    Application,
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-# ====== ЛОГИ ======
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+# ---------------------------
+# ЛОГИРОВАНИЕ
+# ---------------------------
+logger = logging.getLogger("app")
 logging.basicConfig(
-    level=LOG_LEVEL,
+    level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
-logger = logging.getLogger("app")
 
-# ====== ENV ======
-TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
-OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
-OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
+# ---------------------------
+# КОНФИГ
+# ---------------------------
+APP_BASE_URL = os.getenv("APP_BASE_URL", "").rstrip("/")
+AUTO_SET_WEBHOOK = os.getenv("AUTO_SET_WEBHOOK", "true").lower() in ("1", "true", "yes", "y")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()  # <-- ТОЛЬКО ЭТОТ КЛЮЧ
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
-# где взять внешний URL (Render сам пробрасывает переменную)
-WEBHOOK_BASE_URL = (
-    os.getenv("WEBHOOK_BASE_URL")
-    or os.getenv("RENDER_EXTERNAL_URL")
-    or os.getenv("PRIMARY_HOSTNAME")
-    or ""
-).strip()
+OPENAI_FALLBACK = "Извини, у меня временные неполадки с мозгами 🤖. Попробуй позже."
 
-# ====== ГЛОБАЛЬНЫЕ ОБЪЕКТЫ ======
-app = FastAPI()
-_engine: Optional[Engine] = None
-_tapp: Optional[Application] = None
+# ---------------------------
+# БАЗА ДАННЫХ
+# ---------------------------
+def build_engine() -> Engine:
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not set")
+    eng = create_engine(
+        DATABASE_URL,
+        pool_pre_ping=True,
+        future=True,
+    )
+    return eng
 
-# ----- OpenAI (синхронный клиент, дергаем из отдельного потока) -----
-_openai_client = None
+engine: Engine = build_engine()
+
+# ленивое отражение таблицы users (чтобы не рисковать несоответствием схемы)
+_metadata = MetaData()
+_users_table: Optional[Table] = None
+
+
+def get_users_table() -> Table:
+    global _users_table
+    if _users_table is not None:
+        return _users_table
+
+    # Пытаемся сначала со схемой public, потом без схемы (на всякий)
+    try:
+        _metadata.clear()
+        _users_table = Table("users", _metadata, autoload_with=engine, schema="public")
+        return _users_table
+    except Exception:
+        _metadata.clear()
+        _users_table = Table("users", _metadata, autoload_with=engine)
+        return _users_table
+
+
+def ensure_user(chat_id: int) -> Dict[str, Any]:
+    """
+    Находит пользователя по chat_id. Если нет — создаёт минимальную запись.
+    Ничего в схеме не предполагаем жёстко: используем только существующие поля.
+    """
+    users = get_users_table()
+    cols = {c.name for c in users.columns}
+
+    with engine.begin() as conn:
+        # ищем по chat_id
+        if "chat_id" in cols:
+            row = conn.execute(text("SELECT * FROM users WHERE chat_id = :cid LIMIT 1"), {"cid": chat_id}).mappings().first()
+        else:
+            row = None
+
+        if row:
+            return dict(row)
+
+        # если нет записи, пробуем вставить, только если есть поле chat_id
+        if "chat_id" in cols:
+            insert_sql = "INSERT INTO users (chat_id) VALUES (:cid) RETURNING *"
+            row = conn.execute(text(insert_sql), {"cid": chat_id}).mappings().first()
+            return dict(row) if row else {}
+        # если таблица без chat_id — ничего не делаем
+        return {}
+
+
+# ---------------------------
+# OpenAI
+# ---------------------------
+openai_client = None
 if OPENAI_API_KEY:
     try:
         from openai import OpenAI
 
-        _openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
         logger.info("✅ OpenAI client initialized")
     except Exception as e:
-        logger.exception("OpenAI init failed: %s", e)
-else:
-    logger.warning("⚠️ OPENAI_API_KEY is empty (диалоги будут отвечать заглушкой)")
-
-# ====== БАЗА ДАННЫХ ======
-def db() -> Optional[Engine]:
-    """Ленивая инициализация Engine. Схему НЕ создаём, ничего не мигрируем."""
-    global _engine
-    if _engine is None:
-        if not DATABASE_URL:
-            logger.warning("⚠️ DATABASE_URL is empty (память/профили пользователей недоступны)")
-            return None
-        _engine = create_engine(
-            DATABASE_URL,
-            pool_pre_ping=True,
-            pool_recycle=300,
-            future=True,
-        )
-        logger.info("✅ Database initialized")
-    return _engine
+        logger.warning("OpenAI init failed: %s", e)
 
 
-async def fetch_user_profile(chat_id: int) -> Dict[str, Any]:
+async def ask_openai(text_in: str, user_row: Dict[str, Any]) -> str:
     """
-    Аккуратно читаем профиль из существующей таблицы users.
-    Никаких предположений о точных названиях колонок — определяем по факту.
-    Ничего не создаём и не модифицируем.
+    Все диалоги только через OpenAI. Если не доступен — фиксированная заглушка.
+    Никаких эхо.
     """
-    eng = db()
-    if not eng:
-        return {}
+    if not openai_client:
+        return OPENAI_FALLBACK
 
-    # Вытащим список колонок
-    with eng.connect() as conn:
-        cols = set(
-            r[0]
-            for r in conn.execute(
-                text(
-                    """
-                    SELECT column_name
-                    FROM information_schema.columns
-                    WHERE table_schema = 'public' AND table_name = 'users'
-                    """
-                )
-            ).all()
-        )
+    # Подготавливаем простейший профиль из БД (если есть нужные поля)
+    name = user_row.get("name") or user_row.get("first_name") or ""
+    age = user_row.get("age")
+    persona = "Ты дружелюбная собутыльница Катя. Отвечай кратко и по-доброму, на русском."
 
-        # Определяем поле для chat_id
-        chat_id_col_candidates = ["chat_id", "telegram_id", "tg_chat_id"]
-        chat_id_col = next((c for c in chat_id_col_candidates if c in cols), None)
-        if not chat_id_col:
-            logger.warning("users table has no chat_id-like column; columns=%s", cols)
-            return {}
-
-        row = conn.execute(
-            text(f"SELECT * FROM public.users WHERE {chat_id_col} = :cid LIMIT 1"),
-            {"cid": chat_id},
-        ).mappings().first()
-
-        if not row:
-            return {}
-
-        # Сопоставляем возможные поля
-        name_cols = ["display_name", "name", "full_name", "first_name", "username"]
-        age_cols = ["age", "years"]
-        gender_cols = ["gender", "sex"]
-        stars_cols = ["stars", "gifts", "gift_stars", "balance", "coins"]
-
-        def pick(keys: List[str]) -> Optional[Any]:
-            for k in keys:
-                if k in row and row[k] is not None:
-                    return row[k]
-            return None
-
-        profile = {
-            "name": pick(name_cols),
-            "age": pick(age_cols),
-            "gender": pick(gender_cols),
-            "stars": pick(stars_cols),
-            "raw": dict(row),
-        }
-        return profile
-
-
-# ====== OPENAI ДИАЛОГ ======
-AI_STUB = "🤖 Сейчас я не могу поговорить: нет связи с мозгом. Попробуй позже."
-
-async def ask_openai(user_text: str, profile: Dict[str, Any]) -> Optional[str]:
-    """
-    Все диалоги ТОЛЬКО через OpenAI.
-    Если клиента нет или ошибка — возвращаем None, а сверху отправим заглушку.
-    Никаких зеркалок/эхо.
-    """
-    if not _openai_client:
-        return None
-
-    # Сбор persona + память
-    memory_bits: List[str] = []
-    if profile:
-        if profile.get("name"):
-            memory_bits.append(f"Имя пользователя: {profile['name']}")
-        if profile.get("age"):
-            memory_bits.append(f"Возраст пользователя: {profile['age']}")
-        if profile.get("gender"):
-            memory_bits.append(f"Пол пользователя: {profile['gender']}")
-
-    memory_block = "\n".join(memory_bits) if memory_bits else "Информация о пользователе отсутствует."
-
-    system_prompt = (
-        "Ты «Катя Собутыльница» — тёплая, дружелюбная русскоязычная собеседница, коротко и по делу, без занудства. "
-        "Отвечай эмпатично, но не многословно (1–3 предложения). Избегай повторов вопросов пользователя."
-        "\n\n"
-        f"{memory_block}"
-    )
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_text},
-    ]
+    if name:
+        persona += f" Собеседника зовут {name}."
+    if age:
+        persona += f" Ему {age} лет."
 
     try:
-        # openai client v1 — синхронный вызов, поэтому уводим в отдельный поток
-        def _call():
-            resp = _openai_client.chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=messages,
-                temperature=0.7,
-                max_tokens=300,
-            )
-            return resp.choices[0].message.content.strip()
-
-        return await asyncio.to_thread(_call)
+        resp = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": persona},
+                {"role": "user", "content": text_in},
+            ],
+            temperature=0.7,
+        )
+        return (resp.choices[0].message.content or "").strip() or OPENAI_FALLBACK
     except Exception as e:
-        logger.exception("OpenAI error: %s", e)
-        return None
+        logger.error("OpenAI error: %s", e)
+        return OPENAI_FALLBACK
 
 
-# ====== TELEGRAM HANDLERS ======
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Привет! Я Катя Собутыльница 🍷\n"
-        "Пиши, поболтаем. Если вдруг я пропаду — значит у меня нет связи с мозгом (OpenAI), тогда я честно скажу об этом.",
-    )
+# ---------------------------
+# Telegram (python-telegram-bot 20.x)
+# ---------------------------
+telegram_app: Optional[Application] = None
 
 
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:
-        return
-    chat_id = update.effective_chat.id
-    user_text = (update.message.text or "").strip()
-
-    # Загружаем профиль из БД (НЕ меняем схему)
-    profile = await asyncio.to_thread(fetch_user_profile, chat_id)
-
-    # Спрашиваем OpenAI; если не получилось — заглушка
-    reply = await ask_openai(user_text, profile)
-    if not reply:
-        await update.message.reply_text(AI_STUB)
-        return
-
-    await update.message.reply_text(f"🤖 {reply}")
+def mask_token(tok: str) -> str:
+    if not tok:
+        return "<empty>"
+    if len(tok) <= 10:
+        return "***" + tok[-4:]
+    return tok[:6] + "..." + tok[-6:]
 
 
 def build_telegram_app() -> Application:
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is not set")
+    app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
 
-    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-
-    # Команды
-    application.add_handler(CommandHandler("start", cmd_start))
-
-    # Любой текст → в OpenAI (или заглушка)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-
-    return application
+    app.add_handler(CommandHandler("start", start_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    # никаких эхо/тестовых хендлеров
+    return app
 
 
-# ====== FASTAPI LIFECYCLE ======
+async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        chat_id = update.effective_chat.id
+        ensure_user(chat_id)
+        await update.message.reply_text("Привет! Я Катя 🍸 Готова поболтать.")
+    except Exception as e:
+        logger.error("start_handler error: %s", e)
+
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not update.message or not update.message.text:
+            return
+        chat_id = update.effective_chat.id
+        user_row = ensure_user(chat_id)
+        user_text = update.message.text.strip()
+        answer = await ask_openai(user_text, user_row)
+        await update.message.reply_text(answer)
+    except Exception as e:
+        logger.error("text_handler error: %s", e)
+        await update.message.reply_text(OPENAI_FALLBACK)
+
+
+# ---------------------------
+# FastAPI app
+# ---------------------------
+app = FastAPI(title="Drinking Buddy Bot", version="1.0.0")
+
+
+@app.get("/")
+def root() -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "webhook_expected": bool(BOT_TOKEN and APP_BASE_URL),
+        "auto_set_webhook": AUTO_SET_WEBHOOK,
+        "bot_token_masked": mask_token(BOT_TOKEN),
+    }
+
+
 @app.on_event("startup")
 async def on_startup():
-    global _tapp
-    # Инициализируем БД (лениво), чтобы в логах видеть статус
-    _ = db()
+    # проверим базу
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        logger.info("✅ Database initialized")
+    except SQLAlchemyError as e:
+        logger.error("Database init failed: %s", e)
+        raise
 
     # Telegram
-    try:
-        _tapp = build_telegram_app()
-        await _tapp.initialize()
-        await _tapp.start()
+    global telegram_app
+    if not BOT_TOKEN:
+        logger.error("Startup failed: BOT_TOKEN is not set")
+        return
 
-        # Настраиваем webhook, если есть внешний URL
-        if WEBHOOK_BASE_URL:
-            url = WEBHOOK_BASE_URL.rstrip("/") + f"/webhook/{TELEGRAM_BOT_TOKEN}"
-            await _tapp.bot.set_webhook(url=url)
+    telegram_app = build_telegram_app()
+    # для работы process_update требуется initialize()
+    await telegram_app.initialize()
+
+    # Вебхук выставляем только если явно разрешено и известен base URL
+    if AUTO_SET_WEBHOOK and APP_BASE_URL:
+        url = f"{APP_BASE_URL}/webhook/{BOT_TOKEN}"
+        try:
+            await telegram_app.bot.set_webhook(url=url)
             logger.info("✅ Webhook set to %s", url)
-        else:
-            logger.warning("⚠️ WEBHOOK_BASE_URL is empty — webhook не будет настроен")
-
-        logger.info("✅ Telegram application started")
-    except Exception as e:
-        logger.exception("Startup failed: %s", e)
+        except Exception as e:
+            logger.error("Set webhook failed: %s", e)
+    else:
+        logger.warning("Webhook NOT set (AUTO_SET_WEBHOOK=%s, APP_BASE_URL=%s)", AUTO_SET_WEBHOOK, APP_BASE_URL)
 
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    global _tapp
-    if _tapp:
+    global telegram_app
+    if telegram_app:
         try:
-            await _tapp.stop()
-            await _tapp.shutdown()
+            await telegram_app.shutdown()
         except Exception:
             pass
 
 
-# ====== HTTP ENDPOINTS ======
-@app.get("/", response_class=PlainTextResponse)
-async def root() -> str:
-    return "OK"
-
-@app.head("/", response_class=PlainTextResponse)
-async def root_head() -> str:
-    return "OK"
-
+# ---------------------------
+# ВЕБХУК
+# ---------------------------
 @app.post("/webhook/{token}")
-async def telegram_webhook(token: str, request: Request) -> Response:
-    if token != TELEGRAM_BOT_TOKEN:
-        return Response(status_code=status.HTTP_403_FORBIDDEN)
+async def telegram_webhook(token: str, request: Request):
+    if not BOT_TOKEN:
+        return Response(status_code=403, content="BOT_TOKEN not set")
+    if token != BOT_TOKEN:
+        # защищаемся от чужих/старых токенов
+        return Response(status_code=403, content="wrong token")
 
-    if not _tapp:
-        return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
+    if not telegram_app:
+        return Response(status_code=503, content="telegram app not ready")
 
     data = await request.json()
     try:
-        # просто логируем update_id для наглядности
-        upd_id = data.get("update_id")
-        if upd_id is not None:
-            logger.info("Incoming update_id=%s", upd_id)
-
-        update = Update.de_json(data=data, bot=_tapp.bot)
-        await _tapp.process_update(update)
-        return Response(status_code=status.HTTP_200_OK)
+        update = Update.de_json(data, bot=telegram_app.bot)
+        await telegram_app.process_update(update)
+        return JSONResponse({"ok": True})
     except Exception as e:
-        logger.exception("Webhook processing error: %s", e)
-        return Response(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        logger.error("Webhook process error: %s", e)
+        return Response(status_code=500, content="update processing failed")
+
+
+# ---------------------------
+# DEBUG: СХЕМА БАЗЫ
+# ---------------------------
+@app.get("/debug/users-schema")
+def debug_users_schema():
+    """Возвращает структуру таблицы users (колонки, типы, nullable, default)."""
+    try:
+        insp = inspect(engine)
+        # пробуем со схемой public, если нет — без схемы
+        try:
+            cols = insp.get_columns("users", schema="public")
+        except Exception:
+            cols = insp.get_columns("users")
+
+        out = []
+        for c in cols:
+            out.append(
+                {
+                    "name": c.get("name"),
+                    "type": str(c.get("type")),
+                    "nullable": bool(c.get("nullable")),
+                    "default": str(c.get("default")),
+                }
+            )
+        return {"users": out}
+    except Exception as e:
+        logger.error("/debug/users-schema error: %s", e)
+        return JSONResponse({"error": str(e)}, status_code=500)
