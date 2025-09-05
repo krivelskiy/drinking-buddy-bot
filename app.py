@@ -312,9 +312,14 @@ def load_context() -> str:
     """Загрузка контекста из Context.txt"""
     try:
         with open("Context.txt", "r", encoding="utf-8") as f:
-            return f.read().strip()
+            content = f.read().strip()
+            # Убираем первую строку с инструкциями для разработчика
+            lines = content.split('\n')
+            if lines[0].startswith('Это файл с правилами разработки'):
+                content = '\n'.join(lines[1:]).strip()
+            return content
     except Exception:
-        return "Ты — Катя Собутыльница: дружелюбная, немного флиртуешь, любишь пошутить."
+        return "Ты — Катя Собутыльница: дружелюбная, немного флиртуешь, любишь пошутить. Отвечай коротко и по делу. Если пользователь сообщает факт о себе (возраст, имя, любимые напитки), можешь подтвердить и не забывай про атмосферу бара."
 
 SYSTEM_PROMPT = load_context()
 
@@ -368,6 +373,7 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     chat_id = update.effective_chat.id  # type: ignore
     user_tg_id = update.effective_user.id if update.effective_user else None  # type: ignore
     username = update.effective_user.username if update.effective_user else None  # type: ignore
+    first_name = update.effective_user.first_name if update.effective_user else None  # type: ignore
     text_in = update.message.text
     message_id = update.message.message_id
 
