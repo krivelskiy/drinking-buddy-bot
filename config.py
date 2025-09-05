@@ -1,17 +1,10 @@
 import os
 
-def _to_bool(val: str | None, default: bool = False) -> bool:
-    if val is None:
-        return default
-    return val.strip().lower() in {"1", "true", "yes", "y", "on"}
+# Имя ключей согласовано: строго BOT_TOKEN (не TELEGRAM_TOKEN/TELEGRAM_BOT_TOKEN)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")  # должен быть задан в Render → Environment
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:pass@localhost:5432/db")
 
-# === ОФИЦИАЛЬНЫЕ КЛЮЧИ ИЗ ОКРУЖЕНИЯ ===
-BOT_TOKEN: str | None = os.getenv("BOT_TOKEN")
-DATABASE_URL: str | None = os.getenv("DATABASE_URL")
-APP_BASE_URL: str | None = os.getenv("APP_BASE_URL")  # публичный базовый URL сервиса
-AUTO_SET_WEBHOOK: bool = _to_bool(os.getenv("AUTO_SET_WEBHOOK"), True)
-
-# OpenAI может быть пустым — диалоги тогда будут без LLM
-OPENAI_API_KEY: str | None = os.getenv("OPENAI_API_KEY")
-
-# Для удобства: в деве можно положить .env, но на проде берём из Environment
+# База для вебхука. На Render можно не задавать, тогда setWebhook будет пропущен.
+# Если задаёте, то, например: https://drinking-buddy-bot.onrender.com
+BASE_URL = os.getenv("BASE_URL", os.getenv("RENDER_EXTERNAL_URL", "")).strip()
