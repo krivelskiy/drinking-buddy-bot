@@ -325,9 +325,12 @@ def load_context() -> str:
 
 SYSTEM_PROMPT = load_context()
 
-async def llm_reply(user_text: str, username: Optional[str], user_tg_id: int, chat_id: int) -> str:
+async def llm_reply(user_text: str, username: Optional[str], user_tg_id: int, chat_id: int) -> tuple[str, Optional[str]]:
+    """
+    Генерирует ответ LLM и возвращает (ответ, команда_стикера_или_None)
+    """
     if client is None:
-        return FALLBACK_OPENAI_UNAVAILABLE
+        return FALLBACK_OPENAI_UNAVAILABLE, None
     
     try:
         # Получаем возраст пользователя
@@ -346,6 +349,24 @@ async def llm_reply(user_text: str, username: Optional[str], user_tg_id: int, ch
         if username:
             messages.append({"role": "system", "content": f"Username пользователя: @{username}"})
         
+        # Добавляем инструкцию о стикерах
+        messages.append({"role": "system", "content": """
+ВАЖНО: Если в контексте разговора уместно отправить стикер, добавь в конец ответа одну из команд:
+
+СТИКЕРЫ АЛКОГОЛЯ (когда пьете, тостите, предлагаете выпить):
+- [SEND_DRINK_VODKA] - для водки
+- [SEND_DRINK_WHISKY] - для виски  
+- [SEND_DRINK_WINE] - для вина
+- [SEND_DRINK_BEER] - для пива
+
+СТИКЕРЫ НАСТРОЕНИЯ (когда радуетесь или грустите):
+- [SEND_KATYA_HAPPY] - когда весело, радостно, флиртуете
+- [SEND_KATYA_SAD] - когда грустно, скучно, тоскуете
+
+Эти команды будут автоматически удалены из ответа пользователю.
+Используй стикеры естественно - когда действительно уместно по контексту!
+"""})
+        
         # Добавляем историю сообщений (в обратном порядке для правильной последовательности)
         for msg in reversed(recent_messages[-3:]):  # только последние 3 сообщения
             messages.append(msg)
@@ -360,38 +381,84 @@ async def llm_reply(user_text: str, username: Optional[str], user_tg_id: int, ch
             temperature=0.8,  # Увеличиваем температуру для более живых ответов
             max_tokens=250,
         )
-        return resp.choices[0].message.content.strip()
+        
+        response_text = resp.choices[0].message.content.strip()
+        
+        # Проверяем наличие команды стикера
+        sticker_commands = [
+            "[SEND_DRINK_VODKA]", "[SEND_DRINK_WHISKY]", "[SEND_DRINK_WINE]", "[SEND_DRINK_BEER]",
+            "[SEND_KATYA_HAPPY]", "[SEND_KATYA_SAD]"
+        ]
+        
+        sticker_command = None
+        for cmd in sticker_commands:
+            if cmd in response_text:
+                sticker_command = cmd
+                # Удаляем команду из ответа
+                response_text = response_text.replace(cmd, "").strip()
+                logger.info(f"LLM requested sticker: {cmd} for user {user_tg_id}")
+                break
+        
+        return response_text, sticker_command
+        
     except Exception as e:
         logger.exception("OpenAI error: %s", e)
-        return FALLBACK_OPENAI_UNAVAILABLE
+        return FALLBACK_OPENAI_UNAVAILABLE, None
+
+async def send_sticker_by_command(chat_id: int, sticker_command: str) -> None:
+    """Отправка стикера по команде от LLM"""
+    sticker_map = {
+        "[SEND_DRINK_VODKA]": STICKERS["DRINK_VODKA"],
+        "[SEND_DRINK_WHISKY]": STICKERS["DRINK_WHISKY"], 
+        "[SEND_DRINK_WINE]": STICKERS["DRINK_WINE"],
+        "[SEND_DRINK_BEER]": STICKERS["DRINK_BEER"],
+        "[SEND_KATYA_HAPPY]": STICKERS["KATYA_HAPPY"],
+        "[SEND_KATYA_SAD]": STICKERS["KATYA_SAD"],
+    }
+    
+    sticker_id = sticker_map.get(sticker_command)
+    if not sticker_id:
+        logger.warning(f"Unknown sticker command: {sticker_command}")
+        return
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendSticker",
+                json={
+                    "chat_id": chat_id,
+                    "sticker": sticker_id,
+                },
+            )
+            response.raise_for_status()
+            logger.info(f"Sent sticker {sticker_command} to chat {chat_id}")
+        except Exception as e:
+            logger.exception(f"Failed to send sticker {sticker_command}: {e}")
 
 # -----------------------------
 # Хендлер сообщений
 # -----------------------------
 async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.info("Incoming update_id=%s", getattr(update, "update_id", "n/a"))
-
-    if update.message is None or update.message.text is None:
+    """Обработчик сообщений"""
+    if not update.message or not update.message.text:
         return
 
-    chat_id = update.effective_chat.id  # type: ignore
-    user_tg_id = update.effective_user.id if update.effective_user else None  # type: ignore
-    username = update.effective_user.username if update.effective_user else None  # type: ignore
-    first_name = update.effective_user.first_name if update.effective_user else None  # type: ignore
     text_in = update.message.text
+    chat_id = update.message.chat_id
+    user_tg_id = update.message.from_user.id
+    username = update.message.from_user.username
+    first_name = update.message.from_user.first_name
     message_id = update.message.message_id
 
-    if user_tg_id is None:
-        logger.warning("No user_tg_id in update")
-        return
+    logger.info("Received message: %s from user %s", text_in, user_tg_id)
 
-    # 1) апсерт пользователя
+    # 1) Обновляем/создаем пользователя
     try:
         upsert_user_from_update(update)
     except Exception:
-        logger.exception("Failed to upsert user — продолжим без записи")
+        logger.exception("Failed to upsert user")
 
-    # 2) Сохраняем входящее сообщение
+    # 2) Сохраняем сообщение пользователя
     try:
         save_message(chat_id, user_tg_id, "user", text_in, message_id)
     except Exception:
@@ -406,20 +473,10 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except Exception:
             logger.exception("Failed to update user age")
 
-    # 4) Проверяем на триггеры стикеров
-    lower_text = text_in.lower()
-    should_send_sticker = any(trigger in lower_text for trigger in STICKER_TRIGGERS)
-    
-    if should_send_sticker:
-        try:
-            await send_beer_sticker(chat_id)
-        except Exception:
-            logger.exception("Failed to send beer sticker")
+    # 4) Генерируем ответ через OpenAI
+    answer, sticker_command = await llm_reply(text_in, username, user_tg_id, chat_id)
 
-    # 5) Генерируем ответ через OpenAI
-    answer = await llm_reply(text_in, username, user_tg_id, chat_id)
-
-    # 6) Отправляем ответ
+    # 5) Отправляем ответ
     try:
         sent_message = await update.message.reply_text(answer)
         # Сохраняем ответ бота
@@ -427,15 +484,12 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except Exception:
         logger.exception("Failed to send reply")
 
-    # 7) Если упомянут напиток — отправляем соответствующий стикер
-    lower = text_in.lower()
-    for kw, sticker_key in DRINK_KEYWORDS.items():
-        if kw in lower:
-            try:
-                await context.bot.send_sticker(chat_id=chat_id, sticker=STICKERS[sticker_key])
-            except Exception:
-                logger.exception("Failed to send sticker for %s", kw)
-            break
+    # 6) Отправляем стикер если LLM решил что нужно
+    if sticker_command:
+        try:
+            await send_sticker_by_command(chat_id, sticker_command)
+        except Exception:
+            logger.exception("Failed to send sticker")
 
 # -----------------------------
 # FastAPI приложение
