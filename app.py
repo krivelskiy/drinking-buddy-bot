@@ -1,440 +1,185 @@
-import os
-import re
-import random
+import json
 import logging
-from typing import Optional, Dict, Any, List
+from datetime import datetime
+from typing import Optional
 
-from fastapi import FastAPI, Request, Response, Query
+import httpx
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-
-from sqlalchemy import create_engine, text, inspect, MetaData, Table
-from sqlalchemy.engine import Engine
-from sqlalchemy.exc import SQLAlchemyError
-
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-
-# ---------------------------
-# ЛОГИРОВАНИЕ
-# ---------------------------
-logger = logging.getLogger("app")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-
-# ---------------------------
-# КОНФИГ (ТОЛЬКО ТАКИЕ КЛЮЧИ!)
-# ---------------------------
-APP_BASE_URL = os.getenv("APP_BASE_URL", "").rstrip("/")
-AUTO_SET_WEBHOOK = os.getenv("AUTO_SET_WEBHOOK", "true").lower() in ("1", "true", "yes", "y")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-
-OPENAI_FALLBACK = "Извини, у меня временные неполадки с мозгами 🤖. Попробуй позже."
-
-# ---------------------------
-# СТИКЕРЫ — ХРАНИМ В КОДЕ (НЕ УДАЛЯТЬ)
-# ---------------------------
-# 1. Катя весёлая
-STICKER_KATYA_HAPPY = "CAACAgIAAxkBAAEBjrpouGAERwa1uHIJiB5lkhQZps-j_wACcoEAAlGlwEnCOTC-IwMCBDYE"
-# 2. Катя грустная
-STICKER_KATYA_SAD = "CAACAgIAAxkBAAEBjrxouGAyqkcwuIJiCaINHEu-QVn4NAAC1IAAAhynyUnZmmKvP768xzYE"
-# 3. Катя пьёт водку
-STICKER_VODKA = "CAACAgIAAxkBAAEBjr5ouGBBx_1-DTY7HwkdW3rQWOcgRAACsIAAAiFbyEn_G4lgoMu7IjYE"
-# 4. Катя пьёт виски
-STICKER_WHISKY = "CAACAgIAAxkBAAEBjsBouGBSGJX2UPfsKzHTIYlfD7eAswACDH8AAnEbyEnqwlOYBHZL3jYE"
-# 5. Катя пьёт вино
-STICKER_WINE = "CAACAgIAAxkBAAEBjsJouGBk6eEZ60zhrlVYxtaa6o1IpwACzoEAApg_wUm0xElTR8mU3zYE"
-# 6. Катя пьёт пиво
-STICKER_BEER = "CAACAgIAAxkBAAEBjsRouGBy8fdkWj0MhodvqLl3eT9fcgACX4cAAvmhwElmpyDuoHw7IjYE"
-
-# Набор «напиточных» для случайной реакции, когда тип не указан
-DRINK_STICKER_POOL: List[str] = [STICKER_VODKA, STICKER_WHISKY, STICKER_WINE, STICKER_BEER]
-
-# ---------------------------
-# БАЗА ДАННЫХ
-# ---------------------------
-def build_engine() -> Engine:
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is not set")
-    return create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
-
-engine: Engine = build_engine()
-
-_metadata = MetaData()
-_users_table: Optional[Table] = None
-
-
-def get_users_table() -> Table:
-    """Ленивое отражение таблицы users (чтобы не хардкодить схему)."""
-    global _users_table
-    if _users_table is not None:
-        return _users_table
-    try:
-        _metadata.clear()
-        _users_table = Table("users", _metadata, autoload_with=engine, schema="public")
-    except Exception:
-        _metadata.clear()
-        _users_table = Table("users", _metadata, autoload_with=engine)
-    return _users_table
-
-
-def upsert_user_from_tg(update: Update) -> Dict[str, Any]:
-    """
-    Поддерживаем схему из твоей БД:
-    chat_id BIGINT not null, tg_id BIGINT not null, username, first_name, last_name,
-    free_drinks INT default 0, favorite_drinks JSONB default [].
-    """
-    chat = update.effective_chat
-    if not chat:
-        return {}
-
-    chat_id = int(chat.id)
-    tg_id = int(getattr(update.effective_user, "id", chat_id) or chat_id)
-    username = getattr(update.effective_user, "username", None)
-    first_name = getattr(update.effective_user, "first_name", None)
-    last_name = getattr(update.effective_user, "last_name", None)
-
-    users = get_users_table()
-    with engine.begin() as conn:
-        row = conn.execute(
-            text("SELECT * FROM users WHERE chat_id = :cid LIMIT 1"),
-            {"cid": chat_id},
-        ).mappings().first()
-        if not row:
-            row = conn.execute(
-                text("SELECT * FROM users WHERE tg_id = :tid LIMIT 1"),
-                {"tid": tg_id},
-            ).mappings().first()
-
-        if row:
-            conn.execute(
-                text(
-                    """
-                    UPDATE users
-                       SET tg_id      = :tg_id,
-                           username   = :username,
-                           first_name = :first_name,
-                           last_name  = :last_name,
-                           updated_at = now()
-                     WHERE chat_id    = :chat_id
-                    """
-                ),
-                {
-                    "tg_id": tg_id,
-                    "username": username,
-                    "first_name": first_name,
-                    "last_name": last_name,
-                    "chat_id": row["chat_id"],
-                },
-            )
-            row = conn.execute(
-                text("SELECT * FROM users WHERE chat_id = :cid LIMIT 1"),
-                {"cid": row["chat_id"]},
-            ).mappings().first()
-            return dict(row)
-
-        # не нашли — создаём запись
-        row = conn.execute(
-            text(
-                """
-                INSERT INTO users (chat_id, tg_id, username, first_name, last_name)
-                VALUES (:chat_id, :tg_id, :username, :first_name, :last_name)
-                RETURNING *
-                """
-            ),
-            {
-                "chat_id": chat_id,
-                "tg_id": tg_id,
-                "username": username,
-                "first_name": first_name,
-                "last_name": last_name,
-            },
-        ).mappings().first()
-        return dict(row) if row else {}
-
-
-# ---------------------------
-# OpenAI
-# ---------------------------
-openai_client = None
-if OPENAI_API_KEY:
-    try:
-        from openai import OpenAI
-
-        openai_client = OpenAI(api_key=OPENAI_API_KEY)
-        logger.info("✅ OpenAI client initialized")
-    except Exception as e:
-        logger.warning("OpenAI init failed: %s", e)
-
-
-async def ask_openai(text_in: str, user_row: Dict[str, Any]) -> str:
-    if not openai_client:
-        return OPENAI_FALLBACK
-
-    name = user_row.get("name") or user_row.get("first_name") or ""
-    summary = (user_row.get("summary") or "").strip()
-    favs = user_row.get("favorite_drinks")
-
-    favs_str = ""
-    try:
-        if isinstance(favs, list) and favs:
-            favs_str = " Любимые напитки: " + ", ".join(map(str, favs)) + "."
-    except Exception:
-        pass
-
-    persona = "Ты дружелюбная собутыльница Катя. Отвечай кратко и по-доброму, на русском."
-    if name:
-        persona += f" Собеседника зовут {name}."
-    if summary:
-        persona += f" Краткая инфа о нём: {summary}."
-    if favs_str:
-        persona += favs_str
-
-    try:
-        resp = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": persona},
-                {"role": "user", "content": text_in},
-            ],
-            temperature=0.7,
-        )
-        return (resp.choices[0].message.content or "").strip() or OPENAI_FALLBACK
-    except Exception as e:
-        logger.error("OpenAI error: %s", e)
-        return OPENAI_FALLBACK
-
-
-# ---------------------------
-# Telegram (python-telegram-bot 20.x)
-# ---------------------------
-telegram_app: Optional[Application] = None
-
-
-def mask_token(tok: str) -> str:
-    if not tok:
-        return "<empty>"
-    return tok[:6] + "..." + tok[-6:] if len(tok) > 12 else "***" + tok[-4:]
-
-
-def build_telegram_app() -> Application:
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is not set")
-    app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
-
-    app.add_handler(CommandHandler("start", start_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-    return app
-
-
-# --- РАСПОЗНАВАНИЕ «ВЫПИТЬ» И НАПИТКА ---
-# Общее «выпей/налей/...»
-GENERIC_DRINK_RE = re.compile(
-    r"\b(пей|выпей|выпьем|наливай|налей|накатим|шот|шоты|по\s*рюмке|давай\s*выпьем|бухн)\b",
-    re.IGNORECASE,
+from sqlalchemy import (
+    create_engine, Column, BigInteger, String, Text, Integer, TIMESTAMP, inspect
 )
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
-# Конкретные напитки
-VODKA_RE = re.compile(r"\b(водк[аиуые]|vodka)\b", re.IGNORECASE)
-WHISKY_RE = re.compile(r"\b(виск[иий]|whisk(?:y|ey))\b", re.IGNORECASE)
-WINE_RE = re.compile(r"\b(вин[оаеиы]|винц[оа]|wine)\b", re.IGNORECASE)
-BEER_RE = re.compile(r"\b(пив[оаеиы]|по\s*пив[уо]|beer|lager|ale)\b", re.IGNORECASE)
+import config as cfg
 
-async def send_drink_sticker_by_type(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, text_in: str
-) -> bool:
-    """
-    Определяем напиток по тексту и отправляем соответствующий стикер.
-    Возвращает True, если что-то отправили.
-    """
-    chat_id = update.effective_chat.id
+# -----------------------------------------------------------------------------
+# ЛОГИ
+# -----------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+log = logging.getLogger("app")
+
+# -----------------------------------------------------------------------------
+# БАЗА ДАННЫХ
+# -----------------------------------------------------------------------------
+if not cfg.DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set")
+
+engine = create_engine(cfg.DATABASE_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+Base = declarative_base()
+
+class User(Base):
+    __tablename__ = "users"
+
+    # ВАЖНО: соответствует фактической схеме, которую ты прислал
+    chat_id = Column(BigInteger, nullable=False)
+    name = Column(Text, nullable=True)
+    favorite_drinks = Column(JSONB, nullable=True)
+    summary = Column(Text, nullable=True)
+    created_at = Column(TIMESTAMP, nullable=True, default=datetime.utcnow)
+    updated_at = Column(TIMESTAMP, nullable=True, default=datetime.utcnow)
+    tg_id = Column(BigInteger, nullable=False, primary_key=True)
+    username = Column(String(255), nullable=True)
+    first_name = Column(String(255), nullable=True)
+    last_name = Column(String(255), nullable=True)
+    free_drinks = Column(Integer, nullable=False, default=0)
+
+# Ничего не создаём / не мигрируем — работаем с уже существующей таблицей
+log.info("✅ Database initialized")
+
+# -----------------------------------------------------------------------------
+# СТИКЕРЫ
+# -----------------------------------------------------------------------------
+STICKERS = {
+    "happy":  "CAACAgIAAxkBAAEBjrpouGAERwa1uHIJiB5lkhQZps-j_wACcoEAAlGlwEnCOTC-IwMCBDYE",
+    "sad":    "CAACAgIAAxkBAAEBjrxouGAyqkcwuIJiCaINHEu-QVn4NAAC1IAAAhynyUnZmmKvP768xzYE",
+    "vodka":  "CAACAgIAAxkBAAEBjr5ouGBBx_1-DTY7HwkdW3rQWOcgRAACsIAAAiFbyEn_G4lgoMu7IjYE",
+    "whisky": "CAACAgIAAxkBAAEBjsBouGBSGJX2UPfsKzHTIYlfD7eAswACDH8AAnEbyEnqwlOYBHZL3jYE",
+    "wine":   "CAACAgIAAxkBAAEBjsJouGBk6eEZ60zhrlVYxtaa6o1IpwACzoEAApg_wUm0xElTR8mU3zYE",
+    "beer":   "CAACAgIAAxkBAAEBjsRouGBy8fdkWj0MhodvqLl3eT9fcgACX4cAAvmhwElmpyDuoHw7IjYE",
+}
+
+# -----------------------------------------------------------------------------
+# TELEGRAM APPLICATION
+# -----------------------------------------------------------------------------
+def build_telegram_app() -> Optional[Application]:
+    if not cfg.BOT_TOKEN:
+        log.error("BOT_TOKEN is not set")
+        return None
+    return Application.builder().token(cfg.BOT_TOKEN).build()
+
+tapp: Optional[Application] = build_telegram_app()
+
+async def cmd_start(update: Update, _):
+    await update.message.reply_text("Привет! Я Катя Собутыльница 🤖")
+
+async def on_text(update: Update, _):
+    """Простой режим без OpenAI: распознаём напитки + шлём стикер."""
+    text = (update.message.text or "").lower()
+
+    # апдейт/создание пользователя (сохраняем память)
+    session = SessionLocal()
     try:
-        if VODKA_RE.search(text_in):
-            await context.bot.send_sticker(chat_id=chat_id, sticker=STICKER_VODKA)
-            return True
-        if WHISKY_RE.search(text_in):
-            await context.bot.send_sticker(chat_id=chat_id, sticker=STICKER_WHISKY)
-            return True
-        if WINE_RE.search(text_in):
-            await context.bot.send_sticker(chat_id=chat_id, sticker=STICKER_WINE)
-            return True
-        if BEER_RE.search(text_in):
-            await context.bot.send_sticker(chat_id=chat_id, sticker=STICKER_BEER)
-            return True
-        if GENERIC_DRINK_RE.search(text_in):
-            await context.bot.send_sticker(chat_id=chat_id, sticker=random.choice(DRINK_STICKER_POOL))
-            return True
-        return False
-    except Exception as e:
-        logger.warning("send_drink_sticker_by_type failed: %s", e)
-        try:
-            # хотя бы эмодзи, чтобы не молчать
-            await context.bot.send_message(chat_id=chat_id, text="🍺 ик!")
-            return True
-        except Exception:
-            return False
+        uid = update.effective_user.id
+        user = session.query(User).filter(User.tg_id == uid).first()
+        if not user:
+            user = User(
+                tg_id=uid,
+                chat_id=update.effective_chat.id,
+                username=update.effective_user.username,
+                first_name=update.effective_user.first_name,
+                last_name=update.effective_user.last_name,
+            )
+            session.add(user)
+        else:
+            # лёгкий апдейт полей, которые могли поменяться
+            user.username = update.effective_user.username
+            user.first_name = update.effective_user.first_name
+            user.last_name = update.effective_user.last_name
+        session.commit()
+    finally:
+        session.close()
 
+    # распознаём напиток
+    if "водк" in text:
+        await update.message.reply_sticker(STICKERS["vodka"])
+        await update.message.reply_text("Катя пьёт водку 🥃")
+    elif "виск" in text:
+        await update.message.reply_sticker(STICKERS["whisky"])
+        await update.message.reply_text("Катя пьёт виски 🥃")
+    elif "вин" in text and "вино" in text or ("красн" in text or "бел" in text):
+        await update.message.reply_sticker(STICKERS["wine"])
+        await update.message.reply_text("Катя пьёт вино 🍷")
+    elif "пив" in text:
+        await update.message.reply_sticker(STICKERS["beer"])
+        await update.message.reply_text("Катя пьёт пиво 🍺")
+    else:
+        await update.message.reply_sticker(STICKERS["happy"])
+        await update.message.reply_text("Катя рада с тобой выпить 😄")
 
-# --- Handlers ---
-async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        row = upsert_user_from_tg(update)
-        name = row.get("name") or row.get("first_name") or ""
-        hi = f"Привет, {name}! " if name else "Привет! "
-        await update.message.reply_text(hi + "Я Катя 🍸 Готова поболтать.")
-        # милый старт — иногда шлём «весёлую Катю»
-        try:
-            if random.random() < 0.25:
-                await context.bot.send_sticker(chat_id=update.effective_chat.id, sticker=STICKER_KATYA_HAPPY)
-        except Exception:
-            pass
-    except Exception as e:
-        logger.error("start_handler error: %s", e)
-        await update.message.reply_text(OPENAI_FALLBACK)
+if tapp:
+    tapp.add_handler(CommandHandler("start", cmd_start))
+    tapp.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        if not update.message or not update.message.text:
-            return
-        user_text = update.message.text.strip()
-
-        # сохраняем/обновляем пользователя
-        row = upsert_user_from_tg(update)
-
-        # Если просили выпить — отправим подходящий стикер (до ответа модели)
-        await send_drink_sticker_by_type(update, context, user_text)
-
-        # Диалог всегда через OpenAI; если он недоступен — вернём заглушку
-        answer = await ask_openai(user_text, row)
-        await update.message.reply_text(answer)
-    except Exception as e:
-        logger.error("text_handler error: %s", e)
-        await update.message.reply_text(OPENAI_FALLBACK)
-
-
-# ---------------------------
-# FastAPI app
-# ---------------------------
-app = FastAPI(title="Drinking Buddy Bot", version="1.3.0")
-
-
-@app.get("/")
-def root() -> Dict[str, Any]:
-    return {
-        "ok": True,
-        "webhook_expected": bool(BOT_TOKEN and APP_BASE_URL),
-        "auto_set_webhook": AUTO_SET_WEBHOOK,
-        "bot_token_masked": mask_token(BOT_TOKEN),
-        "has_drink_stickers": True,
-        "version": "1.3.0",
-    }
-
+# -----------------------------------------------------------------------------
+# FASTAPI
+# -----------------------------------------------------------------------------
+app = FastAPI(title="Drinking Buddy Bot")
 
 @app.on_event("startup")
 async def on_startup():
-    # DB ping
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        logger.info("✅ Database initialized")
-    except SQLAlchemyError as e:
-        logger.error("Database init failed: %s", e)
-        raise
+    # Инициализируем Telegram Application один раз
+    if tapp:
+        await tapp.initialize()
 
-    # Telegram
-    global telegram_app
-    if not BOT_TOKEN:
-        logger.error("Startup failed: BOT_TOKEN is not set")
-        return
-
-    telegram_app = build_telegram_app()
-    await telegram_app.initialize()
-
-    if AUTO_SET_WEBHOOK and APP_BASE_URL:
-        url = f"{APP_BASE_URL}/webhook/{BOT_TOKEN}"
-        try:
-            await telegram_app.bot.set_webhook(url=url)
-            logger.info("✅ Webhook set to %s", url)
-        except Exception as e:
-            logger.error("Set webhook failed: %s", e)
-    else:
-        logger.warning("Webhook NOT set (AUTO_SET_WEBHOOK=%s, APP_BASE_URL=%s)", AUTO_SET_WEBHOOK, APP_BASE_URL)
-
+    # Ставим вебхук, если разрешено и есть базовый URL
+    if tapp and cfg.AUTO_SET_WEBHOOK and cfg.APP_BASE_URL and cfg.BOT_TOKEN:
+        url = f"{cfg.APP_BASE_URL}/webhook/{cfg.BOT_TOKEN}"
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(f"https://api.telegram.org/bot{cfg.BOT_TOKEN}/setWebhook",
+                                  json={"url": url})
+            if r.status_code == 200 and r.json().get("ok"):
+                log.info(f"✅ Webhook set to {url}")
+            else:
+                log.warning(f"⚠️ setWebhook failed: {r.status_code} {r.text}")
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    global telegram_app
-    if telegram_app:
-        try:
-            await telegram_app.shutdown()
-        except Exception:
-            pass
+    if tapp:
+        await tapp.shutdown()
 
+@app.get("/")
+async def root():
+    return {"status": "ok"}
 
-# ---------------------------
-# ВЕБХУК
-# ---------------------------
+@app.get("/debug/schema")
+def debug_schema():
+    """Отдаём структуру таблицы users (без psql)."""
+    insp = inspect(engine)
+    cols = []
+    for c in insp.get_columns("users"):
+        cols.append({
+            "name": c["name"],
+            "type": str(c["type"]),
+            "nullable": c["nullable"],
+            "default": str(c.get("default")),
+        })
+    return {"users": cols}
+
 @app.post("/webhook/{token}")
 async def telegram_webhook(token: str, request: Request):
-    if not BOT_TOKEN:
-        return Response(status_code=403, content="BOT_TOKEN not set")
-    if token != BOT_TOKEN:
-        return Response(status_code=403, content="wrong token")
-    if not telegram_app:
-        return Response(status_code=503, content="telegram app not ready")
-
+    # защищаем хук: принимаем только правильный токен в пути
+    if not cfg.BOT_TOKEN or token != cfg.BOT_TOKEN or not tapp:
+        return JSONResponse(status_code=403, content={"ok": False})
     data = await request.json()
-    try:
-        update = Update.de_json(data, bot=telegram_app.bot)
-        await telegram_app.process_update(update)
-        return JSONResponse({"ok": True})
-    except Exception as e:
-        logger.error("Webhook process error: %s", e)
-        return Response(status_code=500, content="update processing failed")
-
-
-# ---------------------------
-# DEBUG ЭНДПОИНТЫ
-# ---------------------------
-@app.get("/debug/users-schema")
-def debug_users_schema():
-    try:
-        insp = inspect(engine)
-        try:
-            cols = insp.get_columns("users", schema="public")
-        except Exception:
-            cols = insp.get_columns("users")
-        out = []
-        for c in cols:
-            out.append(
-                {
-                    "name": c.get("name"),
-                    "type": str(c.get("type")),
-                    "nullable": bool(c.get("nullable")),
-                    "default": str(c.get("default")),
-                }
-            )
-        return {"users": out}
-    except Exception as e:
-        logger.error("/debug/users-schema error: %s", e)
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-
-@app.get("/debug/user")
-def debug_user(chat_id: int = Query(..., description="Telegram chat_id")):
-    try:
-        with engine.connect() as conn:
-            row = conn.execute(
-                text("SELECT * FROM users WHERE chat_id = :cid LIMIT 1"),
-                {"cid": chat_id},
-            ).mappings().first()
-            if not row:
-                row = conn.execute(
-                    text("SELECT * FROM users WHERE tg_id = :cid LIMIT 1"),
-                    {"cid": chat_id},
-                ).mappings().first()
-        return {"user": dict(row) if row else None}
-    except Exception as e:
-        logger.error("/debug/user error: %s", e)
-        return JSONResponse({"error": str(e)}, status_code=500)
+    update = Update.de_json(data, tapp.bot)
+    await tapp.process_update(update)
+    return {"ok": True}
