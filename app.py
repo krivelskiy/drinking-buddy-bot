@@ -1,308 +1,410 @@
 import os
-import re
-import time
-import random
+import json
 import logging
-from typing import Optional
+import random
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import PlainTextResponse
 
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackContext,
-    ContextTypes,
-    filters,
-)
+from dotenv import load_dotenv
 
-from openai import OpenAI
-
-from sqlalchemy import create_engine, Column, Integer, String, Text, text, inspect
-from sqlalchemy.orm import sessionmaker, declarative_base
-
-# ---------------------------
-# ЛОГИРОВАНИЕ
-# ---------------------------
+# --- Logging ---
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=logging.INFO,
+    level=LOG_LEVEL,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
-logger = logging.getLogger("app")
+log = logging.getLogger("app")
 
-# ---------------------------
-# ОКРУЖЕНИЕ
-# ---------------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-APP_BASE_URL = os.getenv("APP_BASE_URL")
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./memory.db")
+# --- Env ---
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+APP_BASE_URL = os.getenv("APP_BASE_URL", "").rstrip("/")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()  # postgres://...  | sqlite:///...
+BOT_NAME = os.getenv("BOT_NAME", "Катя Собутыльница")
 
-if not BOT_TOKEN:
-    logger.error("❌ BOT_TOKEN is missing")
-if not OPENAI_API_KEY:
-    logger.error("❌ OPENAI_API_KEY is missing")
-if not APP_BASE_URL:
-    logger.warning("⚠️ APP_BASE_URL is missing (авто-установка вебхука будет пропущена)")
+if not BOT_TOKEN or not APP_BASE_URL:
+    log.warning("BOT_TOKEN or APP_BASE_URL is empty. Webhook won't be set.")
 
-# ---------------------------
-# OpenAI
-# ---------------------------
-client: Optional[OpenAI] = None
+# --- OpenAI (опционально используется в вашем коде ответа ИИ) ---
 try:
-    client = OpenAI(api_key=OPENAI_API_KEY)
-    logger.info("✅ OpenAI client initialized")
+    from openai import OpenAI
+    oai = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+    log.info("✅ OpenAI client initialized")
 except Exception as e:
-    logger.exception("❌ OpenAI init failed: %s", e)
+    oai = None
+    log.exception("OpenAI init failed: %s", e)
 
-# ---------------------------
-# БАЗА (SQLAlchemy)
-# ---------------------------
+# --- SQLAlchemy ---
+from sqlalchemy import (
+    create_engine, Integer, String, DateTime, Text, func, Column
+)
+from sqlalchemy.orm import sessionmaker, declarative_base
+
 Base = declarative_base()
-engine = create_engine(DATABASE_URL, echo=False, future=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 class UserMemory(Base):
     __tablename__ = "user_memory"
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, index=True, unique=True)
-    name = Column(String(100))
-    favorite_drink = Column(String(100))
-    history = Column(Text)
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, index=True, unique=True, nullable=False)
+    name = Column(String(255))
+    favorite_drink = Column(String(255))
+    history = Column(Text)                         # JSONL
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
-def ensure_schema():
-    try:
-        Base.metadata.create_all(bind=engine)
-        insp = inspect(engine)
+class GiftTransaction(Base):
+    __tablename__ = "gift_transactions"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, index=True, nullable=False)
+    gift_code = Column(String(64), nullable=False)         # beer | wine | whiskey | vodka | champagne
+    title = Column(String(255), nullable=False)            # Название подарка
+    amount_stars = Column(Integer, nullable=False)         # Сколько Stars заплатили
+    payload = Column(String(255), nullable=False)          # tg_payload, для сверки
+    created_at = Column(DateTime, default=func.now())
 
-        if not insp.has_table("user_memory"):
-            with engine.begin() as conn:
-                conn.execute(text("""
-                    CREATE TABLE user_memory (
-                        id SERIAL PRIMARY KEY,
-                        user_id INTEGER UNIQUE,
-                        name VARCHAR(100),
-                        favorite_drink VARCHAR(100),
-                        history TEXT
-                    )
-                """))
-                logger.info("ℹ️ Created table user_memory manually")
-
-        cols = {c["name"] for c in insp.get_columns("user_memory")}
-        with engine.begin() as conn:
-            if "favorite_drink" not in cols:
-                conn.execute(text("ALTER TABLE user_memory ADD COLUMN favorite_drink VARCHAR(100)"))
-                logger.info("🔧 Added column user_memory.favorite_drink")
-            if "history" not in cols:
-                conn.execute(text("ALTER TABLE user_memory ADD COLUMN history TEXT"))
-                logger.info("🔧 Added column user_memory.history")
-            if "name" not in cols:
-                conn.execute(text("ALTER TABLE user_memory ADD COLUMN name VARCHAR(100)"))
-                logger.info("🔧 Added column user_memory.name")
-            if "user_id" not in cols:
-                conn.execute(text("ALTER TABLE user_memory ADD COLUMN user_id INTEGER UNIQUE"))
-                logger.info("🔧 Added column user_memory.user_id")
-    except Exception as e:
-        logger.exception("❌ ensure_schema failed: %s", e)
-        raise
-
+# DB init
+ENGINE = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+SessionLocal = sessionmaker(bind=ENGINE, autocommit=False, autoflush=False)
 try:
-    ensure_schema()
-    logger.info("✅ Database initialized")
+    Base.metadata.create_all(ENGINE)
+    log.info("✅ Database initialized")
 except Exception as e:
-    logger.exception("❌ Database init failed: %s", e)
+    log.exception("❌ Database init failed: %s", e)
 
-# ---------------------------
-# Telegram bot (PTB v20)
-# ---------------------------
-tapp = Application.builder().token(BOT_TOKEN).build()
+# --- Telegram PTB v20 ---
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
+)
+from telegram.ext import (
+    Application, ApplicationBuilder, ContextTypes,
+    CommandHandler, MessageHandler, CallbackQueryHandler,
+    PreCheckoutQueryHandler, filters
+)
 
-# Стикеры (file_id)
-STICKER_ID = {
-    "vodka": "CAACAgIAAxkBAAEBjr5ouGBBx_1-DTY7HwkdW3rQWOcgRAACsIAAAiFbyEn_G4lgoMu7IjYE",
-    "whisky": "CAACAgIAAxkBAAEBjsBouGBSGJX2UPfsKzHTIYlfD7eAswACDH8AAnEbyEnqwlOYBHZL3jYE",
-    "wine": "CAACAgIAAxkBAAEBjsJouGBk6eEZ60zhrlVYxtaa6o1IpwACzoEAApg_wUm0xElTR8mU3zYE",
+# Создаём Application один раз
+tapp: Application = ApplicationBuilder().token(BOT_TOKEN).build()
+
+# --- Стикеры по напиткам ---
+STICKERS = {
     "beer": "CAACAgIAAxkBAAEBjsRouGBy8fdkWj0MhodvqLl3eT9fcgACX4cAAvmhwElmpyDuoHw7IjYE",
-    "sad": "CAACAgIAAxkBAAEBjrxouGAyqkcwuIJiCaINHEu-QVn4NAAC1IAAAhynyUnZmmKvP768xzYE",
+    "wine": "CAACAgIAAxkBAAEBjsJouGBk6eEZ60zhrlVYxtaa6o1IpwACzoEAApg_wUm0xElTR8mU3zYE",
+    "whiskey": "CAACAgIAAxkBAAEBjsBouGBSGJX2UPfsKzHTIYlfD7eAswACDH8AAnEbyEnqwlOYBHZL3jYE",
+    "vodka": "CAACAgIAAxkBAAEBjr5ouGBBx_1-DTY7HwkdW3rQWOcgRAACsIAAAiFbyEn_G4lgoMu7IjYE",
     "happy": "CAACAgIAAxkBAAEBjrpouGAERwa1uHIJiB5lkhQZps-j_wACcoEAAlGlwEnCOTC-IwMCBDYE",
+    "sad": "CAACAgIAAxkBAAEBjrxouGAyqkcwuIJiCaINHEu-QVn4NAAC1IAAAhynyUnZmmKvP768xzYE",
+    "champagne": None,  # добавьте file_id, когда загрузите
 }
 
-# Регулярки → ключ
-STICKER_RULES: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"\bпив(о|а|е|у|ом)?\b", re.IGNORECASE), "beer"),
-    (re.compile(r"\bbeer\b", re.IGNORECASE), "beer"),
-    (re.compile(r"\bвин(о|а|е|у|ом|ца)?\b", re.IGNORECASE), "wine"),
-    (re.compile(r"\bwine\b", re.IGNORECASE), "wine"),
-    (re.compile(r"\bводк(а|и|е|у|ой)?\b", re.IGNORECASE), "vodka"),
-    (re.compile(r"\bvodka\b", re.IGNORECASE), "vodka"),
-    (re.compile(r"\bвиск(и|аря|арю)?\b", re.IGNORECASE), "whisky"),
-    (re.compile(r"\bwhisk(e|)y\b", re.IGNORECASE), "whisky"),
-    (re.compile(r"\b(грустн|печаль|тоск)\w*\b", re.IGNORECASE), "sad"),
-    (re.compile(r"\b(весел|радост|кайф)\w*\b", re.IGNORECASE), "happy"),
-]
+# --- «Магазин подарков» (Stars) ---
+# provider_token для Stars должен быть пустым
+PROVIDER_TOKEN_STARS = ""      # ВАЖНО: пустая строка для XTR
+CURRENCY = "XTR"
 
-_last_sticker_ts: dict[int, float] = {}
-STICKER_COOLDOWN_SEC = 5.0
+# КАЖДЫЙ подарок = 1⭐ (по твоей задаче)
+GIFTS = {
+    # code: (title, amount_in_stars, sticker_key)
+    "beer": ("Бокал пива для Кати", 1, "beer"),
+    "wine": ("Бокал вина для Кати", 1, "wine"),
+    "whiskey": ("Шот виски для Кати", 1, "whiskey"),
+    "vodka": ("Стопка водки для Кати", 1, "vodka"),
+    "champagne": ("Бокал шампанского для Кати", 1, "champagne"),
+}
 
-# ---------------------------
-# Хелперы памяти
-# ---------------------------
-def _save_history(session, user_id: int, user_name: str, user_text: str, bot_text: str | None = None):
-    mem = session.query(UserMemory).filter_by(user_id=user_id).first()
+# --- Память/история ---
+def _append_history(mem: UserMemory, role: str, text: str):
+    # Храним «JSON Lines»
+    line = json.dumps({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "role": role,
+        "text": text
+    }, ensure_ascii=False)
+    existed = (mem.history or "").strip()
+    mem.history = (existed + "\n" if existed else "") + line
+
+def _get_or_create_memory(session, user_id: int, user_name: str) -> UserMemory:
+    try:
+        mem = session.query(UserMemory).filter_by(user_id=user_id).first()
+    except Exception:
+        session.rollback()
+        mem = None
     if not mem:
-        mem = UserMemory(user_id=user_id, name=user_name, favorite_drink="", history="")
+        mem = UserMemory(user_id=user_id, name=user_name, favorite_drink=None, history=None)
         session.add(mem)
-        session.flush()
-    if user_text:
-        mem.history = (mem.history or "") + f"\nUser: {user_text}"
-    if bot_text:
-        mem.history = (mem.history or "") + f"\nBot: {bot_text}"
+        session.commit()
+    return mem
+
+def _save_message(session, user_id: int, user_name: str, text: str) -> UserMemory:
+    mem = _get_or_create_memory(session, user_id, user_name)
+    _append_history(mem, "user", text)
     session.commit()
     return mem
 
-def _maybe_extract_favorite_drink(mem: UserMemory, text_in: str) -> None:
-    low = (text_in or "").lower()
-    for key, label in [
-        ("пив", "пиво"), ("вин", "вино"), ("водк", "водка"), ("виск", "виски"),
-        ("beer", "пиво"), ("wine", "вино"), ("vodka", "водка"), ("whisky", "виски"), ("whiskey", "виски"),
-    ]:
-        if key in low:
-            mem.favorite_drink = label
-            break
+def _save_bot_reply(session, mem: UserMemory, text: str):
+    _append_history(mem, "assistant", text)
+    session.commit()
 
-def pick_drink_sticker_by_name(name: str) -> str | None:
-    mapping = {"пиво": "beer", "вино": "wine", "водка": "vodka", "виски": "whisky"}
-    key = mapping.get((name or "").lower().strip())
-    return STICKER_ID.get(key) if key else None
-
-def maybe_send_sticker_for_text(text_in: str) -> str | None:
-    for rx, key in STICKER_RULES:
-        if rx.search(text_in or ""):
-            return STICKER_ID.get(key)
+def _detect_drink(text: str) -> str | None:
+    t = (text or "").lower()
+    if any(w in t for w in ["пиво", "beer", "lager", "эйл"]):
+        return "beer"
+    if any(w in t for w in ["вино", "wine", "мерло", "каберне"]):
+        return "wine"
+    if any(w in t for w in ["виски", "whisky", "whiskey", "бурбон", "скотч"]):
+        return "whiskey"
+    if any(w in t for w in ["водка", "vodka"]):
+        return "vodka"
+    if any(w in t for w in ["шампан", "champagne", "просекко", "кава"]):
+        return "champagne"
     return None
 
-# ---------------------------
-# Хендлеры
-# ---------------------------
-async def start(update: Update, context: CallbackContext):
-    await context.bot.send_message(chat_id=update.effective_chat.id,
-                                   text="Привет! Я Катя. А как тебя зовут и что ты сегодня хочешь выпить?")
+def _should_katya_initiate_toast() -> bool:
+    return random.random() < 0.15
 
-async def handle_message(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    user = update.effective_user
-    user_id = user.id
-    user_name = user.first_name
-    user_text = update.message.text or ""
-    user_text_lower = user_text.lower()
+# --- Ответы ИИ (заглушка) ---
+async def generate_reply(user_text: str, mem: UserMemory) -> str:
+    base = "Привет! Я Катя. А как тебя зовут и что ты сегодня хочешь выпить?"
+    if not user_text:
+        return base
+    fav = mem.favorite_drink or "что-нибудь вкусное"
+    return f"Хороший выбор! Я вообще люблю поболтать за {fav}. О чём поговорим?"
 
-    now = time.time()
-    last_ts = _last_sticker_ts.get(chat_id, 0)
+# --- TG Handlers ---
 
-    # sticker by user text
-    sticker_to_send: Optional[str] = maybe_send_sticker_for_text(user_text_lower)
-
-    # если пишет «пей/выпьем» → любимый напиток
-    if not sticker_to_send and re.search(r"\b(пей|выпьем|наливай)\b", user_text_lower):
-        session = SessionLocal()
-        try:
-            mem = session.query(UserMemory).filter_by(user_id=user_id).first()
-            sticker_to_send = pick_drink_sticker_by_name(mem.favorite_drink) if mem and mem.favorite_drink else STICKER_ID["beer"]
-        finally:
-            session.close()
-
-    if sticker_to_send and (now - last_ts) >= STICKER_COOLDOWN_SEC:
-        await context.bot.send_sticker(chat_id=chat_id, sticker=sticker_to_send)
-        _last_sticker_ts[chat_id] = now
-
-    # ---- GPT ----
-    session = SessionLocal()
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        mem = _save_history(session, user_id, user_name, user_text)
-        _maybe_extract_favorite_drink(mem, user_text)
-        session.commit()
-
-        short_history = (mem.history or "").splitlines()[-20:]
-        system_prompt = (
-            "Ты — Катя, собутыльница. Женский тон, лёгкий флирт, юмор, дружелюбие. "
-            "Иногда сама инициируешь выпивание и предлагаешь тост."
+        user = update.effective_user
+        uid = user.id if user else 0
+        name = user.full_name if user else "Гость"
+        args = context.args or []
+        with SessionLocal() as s:
+            _get_or_create_memory(s, uid, name)
+        if args and args[0] == "gift":
+            await gift_command(update, context)
+            return
+        await update.effective_chat.send_message(
+            "Привет! Я Катя. А как тебя зовут и что ты сегодня хочешь выпить?"
         )
-        messages = [{"role": "system", "content": system_prompt}]
-        for line in short_history:
-            if not line.strip():
-                continue
-            role = "user" if line.startswith("User:") else "assistant"
-            content = line.split(": ", 1)[1] if ": " in line else line
-            messages.append({"role": role, "content": content})
+    except Exception as e:
+        log.exception("start handler failed: %s", e)
 
-        response_text = "Эх, давай просто выпьем за всё хорошее! 🥃"
-        if client:
-            completion = client.chat.completions.create(model="gpt-4o-mini", messages=messages)
-            response_text = (completion.choices[0].message.content or "").strip()
+def _gift_keyboard():
+    buttons = []
+    row = []
+    for code, (title, amount, _) in GIFTS.items():
+        row.append(InlineKeyboardButton(f"{title} · {amount}⭐", callback_data=f"gift:{code}"))
+        if len(row) == 1:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    return InlineKeyboardMarkup(buttons)
 
-        _save_history(session, user_id, user_name, "", response_text)
-    finally:
-        session.close()
+async def gift_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if update.message:
+            await update.message.reply_text("Выбери подарок для Кати:", reply_markup=_gift_keyboard())
+        elif update.callback_query:
+            await update.callback_query.message.reply_text("Выбери подарок для Кати:", reply_markup=_gift_keyboard())
+    except Exception as e:
+        log.exception("gift_command failed: %s", e)
 
-    await context.bot.send_message(chat_id=chat_id, text=response_text)
+async def gift_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        query = update.callback_query
+        await query.answer()
+        data = (query.data or "")
+        if not data.startswith("gift:"):
+            return
+        code = data.split(":", 1)[1]
+        if code not in GIFTS:
+            await query.edit_message_text("Такого подарка нет 😔")
+            return
+        title, amount, _ = GIFTS[code]
+        payload = f"gift:{code}:{int(datetime.now().timestamp())}"
+        prices = [LabeledPrice(label=title, amount=amount)]
+        await context.bot.send_invoice(
+            chat_id=query.message.chat_id,
+            title=title,
+            description=f"Виртуальный подарок для Кати — {title}",
+            payload=payload,
+            provider_token=PROVIDER_TOKEN_STARS,  # ПУСТО для Stars
+            currency=CURRENCY,                    # XTR
+            prices=prices,
+            start_parameter=f"gift_{code}",
+            need_name=False,
+            need_phone_number=False,
+            need_email=False,
+            need_shipping_address=False,
+            is_flexible=False,
+        )
+    except Exception as e:
+        log.exception("gift_select failed: %s", e)
 
-    # ---- Катя сама предлагает выпить (20%) ----
-    if random.random() < 0.2 and (time.time() - last_ts) >= STICKER_COOLDOWN_SEC:
-        session = SessionLocal()
-        fav_sticker = STICKER_ID["beer"]
+async def precheckout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        q = update.pre_checkout_query
+        ok = True
+        err = None
+
+        payload = q.invoice_payload or ""
+        if not (payload.startswith("gift:") and len(payload.split(":")) >= 2):
+            ok, err = False, "Неверные данные платежа"
+        else:
+            code = payload.split(":")[1]
+            if code not in GIFTS:
+                ok, err = False, "Неизвестный подарок"
+            else:
+                expected_amount = GIFTS[code][1]
+                if q.currency != CURRENCY or q.total_amount != expected_amount:
+                    ok, err = False, "Сумма или валюта не совпадает"
+
+        await context.bot.answer_pre_checkout_query(
+            pre_checkout_query_id=q.id,
+            ok=ok,
+            error_message=err if not ok else None
+        )
+    except Exception as e:
+        log.exception("precheckout_handler failed: %s", e)
+
+async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        sp = update.message.successful_payment
+        user = update.effective_user
+        uid = user.id if user else 0
+        name = user.full_name if user else "Гость"
+
+        payload = sp.invoice_payload or ""
+        amount = sp.total_amount or 0
+        code = "unknown"
+        if payload.startswith("gift:"):
+            parts = payload.split(":")
+            if len(parts) >= 2:
+                code = parts[1]
+
+        title, _, sticker_key = GIFTS.get(code, (f"Подарок ({code})", amount, "happy"))
+
+        # сохраняем транзакцию
+        with SessionLocal() as s:
+            _get_or_create_memory(s, uid, name)
+            gt = GiftTransaction(
+                user_id=uid, gift_code=code, title=title,
+                amount_stars=amount, payload=payload
+            )
+            s.add(gt)
+            s.commit()
+
+        # благодарность + тост + стикер
+        thanks = f"Спасибо за подарок! *{title}* — это так мило 🥰\n" \
+                 f"Поднимаю бокал за тебя! За щедрость и за классное настроение! 🥂"
+        await update.message.reply_text(thanks, parse_mode="Markdown")
+
+        st_id = STICKERS.get(sticker_key)
+        if st_id:
+            await context.bot.send_sticker(chat_id=update.effective_chat.id, sticker=st_id)
+        else:
+            if STICKERS.get("happy"):
+                await context.bot.send_sticker(chat_id=update.effective_chat.id, sticker=STICKERS["happy"])
+
+        log.info("Gift received: user=%s code=%s stars=%s payload=%s", uid, code, amount, payload)
+    except Exception as e:
+        log.exception("successful_payment_handler failed: %s", e)
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Основной обработчик текста: сохраняет историю, реагирует на напитки,
+    иногда сама инициирует тост со стикером, и генерит общий ответ.
+    """
+    try:
+        if not update.message:
+            return
+        user = update.effective_user
+        uid = user.id if user else 0
+        name = user.full_name if user else "Гость"
+        text = update.message.text or ""
+
+        # Сохраним историю
+        with SessionLocal() as s:
+            mem = _save_message(s, uid, name, text)
+
+            low = text.lower()
+            if "мой любимый" in low and ("пиво" in low or "вино" in low or "виски" in low or "водк" in low or "шампан" in low):
+                fav = text.split("—", 1)[-1].strip() if "—" in text else (
+                    text.split(":", 1)[-1].strip() if ":" in text else None
+                )
+                mem.favorite_drink = fav or mem.favorite_drink or "без уточнений"
+                s.commit()
+                await update.message.reply_text(f"Запомнила! Твой любимый напиток: {mem.favorite_drink}")
+
+            drink = _detect_drink(text)
+            if drink:
+                st_id = STICKERS.get(drink)
+                if st_id:
+                    await context.bot.send_sticker(chat_id=update.effective_chat.id, sticker=st_id)
+                await update.message.reply_text("За нас! 🍻 Давай поддерживать хорошее настроение!")
+
+            if not drink and _should_katya_initiate_toast():
+                rnd = random.choice(["beer", "wine", "whiskey", "vodka"])
+                st = STICKERS.get(rnd)
+                if st:
+                    await context.bot.send_sticker(chat_id=update.effective_chat.id, sticker=st)
+                await update.message.reply_text("Я первая поднимаю бокал! 🥂 Тост за приятную беседу!")
+
+            reply = await generate_reply(text, mem)
+            await update.message.reply_text(reply)
+            _save_bot_reply(s, mem, reply)
+
+    except Exception as e:
+        log.exception("handle_message failed: %s", e)
         try:
-            mem = session.query(UserMemory).filter_by(user_id=user_id).first()
-            if mem and mem.favorite_drink:
-                sid = pick_drink_sticker_by_name(mem.favorite_drink)
-                if sid:
-                    fav_sticker = sid
-        finally:
-            session.close()
+            await update.effective_chat.send_message(
+                "У меня небольшая заминка 🙈 Попробуй повторить, а я всё быстро починю."
+            )
+        except Exception:
+            pass
 
-        toast_text = random.choice([
-            "Давай я первая подниму бокал! 🥂 За нас!",
-            "Ну что, предлагаю тост: за хорошее настроение! 🍻",
-            "Я налила! Поднимем бокалы и выпьем вместе! 🍷",
-        ])
-        await context.bot.send_message(chat_id=chat_id, text=toast_text)
-        await context.bot.send_sticker(chat_id=chat_id, sticker=fav_sticker)
-        _last_sticker_ts[chat_id] = time.time()
+# --- FastAPI + Webhook ---
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.exception("PTB error_handler caught exception", exc_info=context.error)
-
-tapp.add_handler(CommandHandler("start", start))
-tapp.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-tapp.add_error_handler(error_handler)
-
-# ---------------------------
-# FastAPI
-# ---------------------------
 app = FastAPI()
 
 @app.on_event("startup")
-async def _startup():
-    await tapp.initialize()
-    if APP_BASE_URL:
-        wh_url = f"{APP_BASE_URL}/webhook/{BOT_TOKEN}"
-        await tapp.bot.set_webhook(url=wh_url, allowed_updates=["message"])
-        logger.info("✅ Webhook set to %s", wh_url)
+async def on_startup():
+    try:
+        await tapp.initialize()
 
-@app.on_event("shutdown")
-async def _shutdown():
-    await tapp.shutdown()
+        tapp.add_handler(CommandHandler("start", start))
+        tapp.add_handler(CommandHandler("gift", gift_command))
+        tapp.add_handler(CallbackQueryHandler(gift_select, pattern=r"^gift:"))
+        tapp.add_handler(PreCheckoutQueryHandler(precheckout_handler))
+        tapp.add_handler(MessageHandler(filters.StatusUpdate.SUCCESSFUL_PAYMENT, successful_payment_handler))
+        tapp.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-@app.post("/webhook/{token}")
+        if BOT_TOKEN and APP_BASE_URL:
+            wh_url = f"{APP_BASE_URL}/webhook/{BOT_TOKEN}"
+            await tapp.bot.set_webhook(url=wh_url, allowed_updates=["message", "callback_query", "pre_checkout_query"])
+            log.info("✅ Webhook set to %s", wh_url)
+        else:
+            log.warning("Webhook not set (no BOT_TOKEN/APP_BASE_URL)")
+    except Exception as e:
+        log.exception("Startup failed: %s", e)
+
+@app.get("/", response_class=PlainTextResponse)
+async def health():
+    return "ok"
+
+@app.post("/webhook/{token}", response_class=PlainTextResponse)
 async def telegram_webhook(token: str, request: Request):
     if token != BOT_TOKEN:
-        return JSONResponse(status_code=403, content={"ok": False, "error": "Forbidden"})
-    data = await request.json()
-    update = Update.de_json(data, tapp.bot)
-    await tapp.process_update(update)
-    return JSONResponse(content={"ok": True})
-
-@app.get("/")
-async def health():
-    return {"status": "ok"}
+        return PlainTextResponse("forbidden", status_code=403)
+    try:
+        data = await request.json()
+        upd_id = data.get("update_id")
+        log.info("Incoming update_id=%s", upd_id)
+        update = Update.de_json(data=data, bot=tapp.bot)
+        await tapp.process_update(update)
+        return "ok"
+    except Exception as e:
+        log.exception("Webhook error: %s", e)
+        return "ok"
