@@ -49,6 +49,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS {USERS_TABLE} (
                 id SERIAL PRIMARY KEY,
                 user_tg_id BIGINT UNIQUE NOT NULL,
+                chat_id BIGINT NOT NULL,
                 username TEXT,
                 first_name TEXT,
                 last_name TEXT,
@@ -73,49 +74,44 @@ def init_db():
         
         # Добавляем недостающие колонки к существующим таблицам
         try:
+            # Добавляем колонку chat_id к users если её нет
+            conn.execute(DDL(f"""
+                ALTER TABLE {USERS_TABLE} 
+                ADD COLUMN IF NOT EXISTS chat_id BIGINT NOT NULL DEFAULT 0
+            """))
+            
             # Добавляем колонку user_tg_id к users если её нет
             conn.execute(DDL(f"""
                 ALTER TABLE {USERS_TABLE} 
                 ADD COLUMN IF NOT EXISTS user_tg_id BIGINT UNIQUE
             """))
-        except Exception:
-            pass  # Колонка уже существует
             
-        try:
             # Добавляем колонку age к users если её нет
             conn.execute(DDL(f"""
                 ALTER TABLE {USERS_TABLE} 
                 ADD COLUMN IF NOT EXISTS age INTEGER
             """))
-        except Exception:
-            pass  # Колонка уже существует
             
-        try:
             # Добавляем колонку user_tg_id к messages если её нет
             conn.execute(DDL(f"""
                 ALTER TABLE {MESSAGES_TABLE} 
                 ADD COLUMN IF NOT EXISTS user_tg_id BIGINT NOT NULL DEFAULT 0
             """))
-        except Exception:
-            pass  # Колонка уже существует
             
-        try:
             # Добавляем колонку message_id к messages если её нет
             conn.execute(DDL(f"""
                 ALTER TABLE {MESSAGES_TABLE} 
                 ADD COLUMN IF NOT EXISTS message_id INTEGER
             """))
-        except Exception:
-            pass  # Колонка уже существует
             
-        try:
             # Добавляем колонку reply_to_message_id к messages если её нет
             conn.execute(DDL(f"""
                 ALTER TABLE {MESSAGES_TABLE} 
                 ADD COLUMN IF NOT EXISTS reply_to_message_id INTEGER
             """))
-        except Exception:
-            pass  # Колонка уже существует
+            
+        except Exception as e:
+            logger.warning(f"Some columns might already exist: {e}")
     
     logger.info("✅ Database tables created/verified")
 
@@ -155,50 +151,49 @@ U = DB_FIELDS["users"]  # короткий алиас
 M = DB_FIELDS["messages"]  # короткий алиас
 
 def upsert_user_from_update(update: Update) -> None:
-    """
-    Без ON CONFLICT, чтобы не зависеть от уникальных ограничений:
-    1) ищем пользователя по user_tg_id
-    2) UPDATE если найден, иначе INSERT
-    """
-    if update.effective_chat is None or update.effective_user is None:
+    """Обновление/создание пользователя из Telegram Update"""
+    if not update.message or not update.message.from_user:
         return
 
-    chat_id = update.effective_chat.id
-    tg_id = update.effective_user.id
-    username = update.effective_user.username
-    first_name = update.effective_user.first_name
-    last_name = update.effective_user.last_name
+    tg_id = update.message.from_user.id
+    chat_id = update.message.chat_id
+    username = update.message.from_user.username
+    first_name = update.message.from_user.first_name
+    last_name = update.message.from_user.last_name
 
     with engine.begin() as conn:
-        row = conn.execute(
+        # Проверяем существует ли пользователь
+        existing = conn.execute(
             text(f"SELECT {U['user_tg_id']} FROM {USERS_TABLE} WHERE {U['user_tg_id']} = :tg_id"),
             {"tg_id": tg_id},
         ).fetchone()
 
-        if row:
+        if existing:
+            # Обновляем существующего пользователя
             conn.execute(
                 text(f"""
                     UPDATE {USERS_TABLE}
-                    SET {U['username']} = :username,
-                        {U['first_name']} = :first_name,
-                        {U['last_name']} = :last_name
+                    SET {U['username']} = :username, {U['first_name']} = :first_name, {U['last_name']} = :last_name, {U['chat_id']} = :chat_id
                     WHERE {U['user_tg_id']} = :tg_id
                 """),
                 {
                     "tg_id": tg_id,
+                    "chat_id": chat_id,
                     "username": username,
                     "first_name": first_name,
                     "last_name": last_name,
                 },
             )
         else:
+            # Создаем нового пользователя
             conn.execute(
                 text(f"""
-                    INSERT INTO {USERS_TABLE} ({U['user_tg_id']}, {U['username']}, {U['first_name']}, {U['last_name']})
-                    VALUES (:tg_id, :username, :first_name, :last_name)
+                    INSERT INTO {USERS_TABLE} ({U['user_tg_id']}, {U['chat_id']}, {U['username']}, {U['first_name']}, {U['last_name']})
+                    VALUES (:tg_id, :chat_id, :username, :first_name, :last_name)
                 """),
                 {
                     "tg_id": tg_id,
+                    "chat_id": chat_id,
                     "username": username,
                     "first_name": first_name,
                     "last_name": last_name,
