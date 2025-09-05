@@ -1,386 +1,362 @@
+# app.py
 import os
 import json
 import logging
-import random
 from datetime import datetime, timezone
+from typing import Optional, List, Tuple
 
-from fastapi import FastAPI, Request
-from fastapi.responses import PlainTextResponse
-
+from fastapi import FastAPI, Request, Header
+from fastapi.responses import JSONResponse, PlainTextResponse
+from pydantic import BaseModel
 from dotenv import load_dotenv
 
-# --- Logging ---
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+import sqlalchemy as sa
+from sqlalchemy import String, BigInteger, Integer, DateTime, JSON, ForeignKey, Text
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+
+import httpx
+
+from telegram import (
+    Update,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    LabeledPrice,
+)
+from telegram.ext import (
+    Application, ApplicationBuilder,
+    CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters, PreCheckoutQueryHandler,
+)
+
+# -----------------------------------------------------------------------------
+# Конфиг и логирование
+# -----------------------------------------------------------------------------
+load_dotenv()
+
+log = logging.getLogger("app")
 logging.basicConfig(
-    level=LOG_LEVEL,
+    level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
-log = logging.getLogger("app")
 
-# --- Env ---
-load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-APP_BASE_URL = os.getenv("APP_BASE_URL", "").rstrip("/")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()  # postgres://...  | sqlite:///...
-BOT_NAME = os.getenv("BOT_NAME", "Катя Собутыльница")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+APP_BASE_URL = os.getenv("APP_BASE_URL", "")  # например: https://drinking-buddy-bot.onrender.com
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./db.sqlite3")
+PAYMENT_PROVIDER_TOKEN = os.getenv("PAYMENT_PROVIDER_TOKEN", "")
 
-if not BOT_TOKEN or not APP_BASE_URL:
-    log.warning("BOT_TOKEN or APP_BASE_URL is empty. Webhook won't be set.")
+if not OPENAI_API_KEY:
+    log.warning("OPENAI_API_KEY is empty")
+if not BOT_TOKEN:
+    log.warning("TELEGRAM_TOKEN is empty (webhook/бот работать не будет)")
+if not APP_BASE_URL:
+    log.warning("APP_BASE_URL is empty (webhook не будет установлен)")
 
-# --- OpenAI (опционально используется в вашем коде ответа ИИ) ---
-try:
-    from openai import OpenAI
-    oai = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-    log.info("✅ OpenAI client initialized")
-except Exception as e:
-    oai = None
-    log.exception("OpenAI init failed: %s", e)
-
-# --- SQLAlchemy ---
-from sqlalchemy import (
-    create_engine, Integer, String, DateTime, Text, func, Column
-)
-from sqlalchemy.orm import sessionmaker, declarative_base
-
+# -----------------------------------------------------------------------------
+# БД (SQLAlchemy)
+# -----------------------------------------------------------------------------
+engine = sa.create_engine(DATABASE_URL, future=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 Base = declarative_base()
 
-class UserMemory(Base):
-    __tablename__ = "user_memory"
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, index=True, unique=True, nullable=False)
-    name = Column(String(255))
-    favorite_drink = Column(String(255))
-    history = Column(Text)                         # JSONL
-    created_at = Column(DateTime, default=func.now())
-    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+class User(Base):
+    __tablename__ = "users"
+    id = sa.Column(Integer, primary_key=True)
+    chat_id = sa.Column(BigInteger, nullable=False, index=True)
+    username = sa.Column(String(255), nullable=True)
+    first_name = sa.Column(String(255), nullable=True)
+    last_name = sa.Column(String(255), nullable=True)
+    created_at = sa.Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    updated_at = sa.Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    # баланс звёзд мы не учитываем локально (звёзды — валюта Telegram).
+    # Но фиксируем покупки напитков/подарков в отдельной таблице.
+
+    transactions = relationship("GiftTransaction", back_populates="user", cascade="all, delete-orphan")
+
 
 class GiftTransaction(Base):
     __tablename__ = "gift_transactions"
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, index=True, nullable=False)
-    gift_code = Column(String(64), nullable=False)         # beer | wine | whiskey | vodka | champagne
-    title = Column(String(255), nullable=False)            # Название подарка
-    amount_stars = Column(Integer, nullable=False)         # Сколько Stars заплатили
-    payload = Column(String(255), nullable=False)          # tg_payload, для сверки
-    created_at = Column(DateTime, default=func.now())
+    id = sa.Column(Integer, primary_key=True)
+    user_id = sa.Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    tg_payment_charge_id = sa.Column(String(255), nullable=True)  # id чека из Telegram
+    payload = sa.Column(String(255), nullable=True)               # что покупали
+    total_amount = sa.Column(Integer, nullable=False, default=0)  # в минимальных единицах (копейки/стар-копейки)
+    currency = sa.Column(String(10), nullable=False, default="XTR")  # для звёзд формально "XTR"
+    status = sa.Column(String(32), nullable=False, default="pending")  # pending, successful, failed
+    raw = sa.Column(JSON, nullable=True)
 
-# DB init
-ENGINE = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
-SessionLocal = sessionmaker(bind=ENGINE, autocommit=False, autoflush=False)
-try:
-    Base.metadata.create_all(ENGINE)
+    created_at = sa.Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    updated_at = sa.Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    user = relationship("User", back_populates="transactions")
+
+
+def init_db():
+    Base.metadata.create_all(bind=engine)
     log.info("✅ Database initialized")
-except Exception as e:
-    log.exception("❌ Database init failed: %s", e)
 
-# --- Telegram PTB v20 ---
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
-)
-from telegram.ext import (
-    Application, ApplicationBuilder, ContextTypes,
-    CommandHandler, MessageHandler, CallbackQueryHandler,
-    PreCheckoutQueryHandler, filters
-)
 
-# Создаём Application один раз
-tapp: Application = ApplicationBuilder().token(BOT_TOKEN).build()
+# -----------------------------------------------------------------------------
+# OpenAI (заглушка под ваш текущий диалоговый обработчик)
+# -----------------------------------------------------------------------------
+async def ask_llm(prompt: str) -> str:
+    # здесь ваш вызов OpenAI; оставляем простую заглушку чтобы не мешать работе
+    return f"🤖 {prompt}"
 
-# --- Стикеры по напиткам ---
-STICKERS = {
-    "beer": "CAACAgIAAxkBAAEBjsRouGBy8fdkWj0MhodvqLl3eT9fcgACX4cAAvmhwElmpyDuoHw7IjYE",
-    "wine": "CAACAgIAAxkBAAEBjsJouGBk6eEZ60zhrlVYxtaa6o1IpwACzoEAApg_wUm0xElTR8mU3zYE",
-    "whiskey": "CAACAgIAAxkBAAEBjsBouGBSGJX2UPfsKzHTIYlfD7eAswACDH8AAnEbyEnqwlOYBHZL3jYE",
-    "vodka": "CAACAgIAAxkBAAEBjr5ouGBBx_1-DTY7HwkdW3rQWOcgRAACsIAAAiFbyEn_G4lgoMu7IjYE",
-    "happy": "CAACAgIAAxkBAAEBjrpouGAERwa1uHIJiB5lkhQZps-j_wACcoEAAlGlwEnCOTC-IwMCBDYE",
-    "sad": "CAACAgIAAxkBAAEBjrxouGAyqkcwuIJiCaINHEu-QVn4NAAC1IAAAhynyUnZmmKvP768xzYE",
-    "champagne": None,  # добавьте file_id, когда загрузите
-}
 
-# --- «Магазин подарков» (Stars) ---
-# provider_token для Stars должен быть пустым
-PROVIDER_TOKEN_STARS = ""      # ВАЖНО: пустая строка для XTR
-CURRENCY = "XTR"
+# -----------------------------------------------------------------------------
+# Утилиты БД
+# -----------------------------------------------------------------------------
+def get_or_create_user(session, chat_id: int, username: Optional[str], first_name: Optional[str], last_name: Optional[str]) -> User:
+    user = session.execute(sa.select(User).where(User.chat_id == chat_id)).scalar_one_or_none()
+    if user is None:
+        user = User(
+            chat_id=chat_id,
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+        )
+        session.add(user)
+        session.flush()
+        log.info("Created user chat_id=%s id=%s", chat_id, user.id)
+    else:
+        # мягко обновим видимые поля (без обязательных commit'ов если не менялись)
+        changed = False
+        if user.username != username:
+            user.username = username; changed = True
+        if user.first_name != first_name:
+            user.first_name = first_name; changed = True
+        if user.last_name != last_name:
+            user.last_name = last_name; changed = True
+        if changed:
+            session.flush()
+    return user
 
-# КАЖДЫЙ подарок = 1⭐ (по твоей задаче)
-GIFTS = {
-    # code: (title, amount_in_stars, sticker_key)
-    "beer": ("Бокал пива для Кати", 1, "beer"),
-    "wine": ("Бокал вина для Кати", 1, "wine"),
-    "whiskey": ("Шот виски для Кати", 1, "whiskey"),
-    "vodka": ("Стопка водки для Кати", 1, "vodka"),
-    "champagne": ("Бокал шампанского для Кати", 1, "champagne"),
-}
 
-# --- Память/история ---
-def _append_history(mem: UserMemory, role: str, text: str):
-    # Храним «JSON Lines»
-    line = json.dumps({
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "role": role,
-        "text": text
-    }, ensure_ascii=False)
-    existed = (mem.history or "").strip()
-    mem.history = (existed + "\n" if existed else "") + line
+# -----------------------------------------------------------------------------
+# Логика подарков/покупки напитков за звезды
+# -----------------------------------------------------------------------------
+# Каждый напиток — 1 звезда. Реализуем простое меню и платёж через звезды.
+DRINKS = [
+    ("espresso", "Эспрессо ☕", 1),
+    ("latte", "Латте 🥛☕", 1),
+    ("beer", "Пиво 🍺", 1),
+    ("cola", "Кола 🥤", 1),
+]
 
-def _get_or_create_memory(session, user_id: int, user_name: str) -> UserMemory:
-    try:
-        mem = session.query(UserMemory).filter_by(user_id=user_id).first()
-    except Exception:
-        session.rollback()
-        mem = None
-    if not mem:
-        mem = UserMemory(user_id=user_id, name=user_name, favorite_drink=None, history=None)
-        session.add(mem)
-        session.commit()
-    return mem
+def build_drinks_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for slug, title, price in DRINKS:
+        rows.append([InlineKeyboardButton(f"{title} — {price}⭐", callback_data=f"buy:{slug}")])
+    return InlineKeyboardMarkup(rows)
 
-def _save_message(session, user_id: int, user_name: str, text: str) -> UserMemory:
-    mem = _get_or_create_memory(session, user_id, user_name)
-    _append_history(mem, "user", text)
-    session.commit()
-    return mem
-
-def _save_bot_reply(session, mem: UserMemory, text: str):
-    _append_history(mem, "assistant", text)
-    session.commit()
-
-def _detect_drink(text: str) -> str | None:
-    t = (text or "").lower()
-    if any(w in t for w in ["пиво", "beer", "lager", "эйл"]):
-        return "beer"
-    if any(w in t for w in ["вино", "wine", "мерло", "каберне"]):
-        return "wine"
-    if any(w in t for w in ["виски", "whisky", "whiskey", "бурбон", "скотч"]):
-        return "whiskey"
-    if any(w in t for w in ["водка", "vodka"]):
-        return "vodka"
-    if any(w in t for w in ["шампан", "champagne", "просекко", "кава"]):
-        return "champagne"
+def find_drink(slug: str) -> Optional[Tuple[str, str, int]]:
+    for d in DRINKS:
+        if d[0] == slug:
+            return d
     return None
 
-def _should_katya_initiate_toast() -> bool:
-    return random.random() < 0.15
 
-# --- Ответы ИИ (заглушка) ---
-async def generate_reply(user_text: str, mem: UserMemory) -> str:
-    base = "Привет! Я Катя. А как тебя зовут и что ты сегодня хочешь выпить?"
-    if not user_text:
-        return base
-    fav = mem.favorite_drink or "что-нибудь вкусное"
-    return f"Хороший выбор! Я вообще люблю поболтать за {fav}. О чём поговорим?"
-
-# --- TG Handlers ---
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        user = update.effective_user
-        uid = user.id if user else 0
-        name = user.full_name if user else "Гость"
-        args = context.args or []
-        with SessionLocal() as s:
-            _get_or_create_memory(s, uid, name)
-        if args and args[0] == "gift":
-            await gift_command(update, context)
-            return
-        await update.effective_chat.send_message(
-            "Привет! Я Катя. А как тебя зовут и что ты сегодня хочешь выпить?"
-        )
-    except Exception as e:
-        log.exception("start handler failed: %s", e)
-
-def _gift_keyboard():
-    buttons = []
-    row = []
-    for code, (title, amount, _) in GIFTS.items():
-        row.append(InlineKeyboardButton(f"{title} · {amount}⭐", callback_data=f"gift:{code}"))
-        if len(row) == 1:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-    return InlineKeyboardMarkup(buttons)
-
-async def gift_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        if update.message:
-            await update.message.reply_text("Выбери подарок для Кати:", reply_markup=_gift_keyboard())
-        elif update.callback_query:
-            await update.callback_query.message.reply_text("Выбери подарок для Кати:", reply_markup=_gift_keyboard())
-    except Exception as e:
-        log.exception("gift_command failed: %s", e)
-
-async def gift_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        query = update.callback_query
-        await query.answer()
-        data = (query.data or "")
-        if not data.startswith("gift:"):
-            return
-        code = data.split(":", 1)[1]
-        if code not in GIFTS:
-            await query.edit_message_text("Такого подарка нет 😔")
-            return
-        title, amount, _ = GIFTS[code]
-        payload = f"gift:{code}:{int(datetime.now().timestamp())}"
-        prices = [LabeledPrice(label=title, amount=amount)]
-        await context.bot.send_invoice(
-            chat_id=query.message.chat_id,
-            title=title,
-            description=f"Виртуальный подарок для Кати — {title}",
-            payload=payload,
-            provider_token=PROVIDER_TOKEN_STARS,  # ПУСТО для Stars
-            currency=CURRENCY,                    # XTR
-            prices=prices,
-            start_parameter=f"gift_{code}",
-            need_name=False,
-            need_phone_number=False,
-            need_email=False,
-            need_shipping_address=False,
-            is_flexible=False,
-        )
-    except Exception as e:
-        log.exception("gift_select failed: %s", e)
-
-async def precheckout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        q = update.pre_checkout_query
-        ok = True
-        err = None
-
-        payload = q.invoice_payload or ""
-        if not (payload.startswith("gift:") and len(payload.split(":")) >= 2):
-            ok, err = False, "Неверные данные платежа"
-        else:
-            code = payload.split(":")[1]
-            if code not in GIFTS:
-                ok, err = False, "Неизвестный подарок"
-            else:
-                expected_amount = GIFTS[code][1]
-                if q.currency != CURRENCY or q.total_amount != expected_amount:
-                    ok, err = False, "Сумма или валюта не совпадает"
-
-        await context.bot.answer_pre_checkout_query(
-            pre_checkout_query_id=q.id,
-            ok=ok,
-            error_message=err if not ok else None
-        )
-    except Exception as e:
-        log.exception("precheckout_handler failed: %s", e)
-
-async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        sp = update.message.successful_payment
-        user = update.effective_user
-        uid = user.id if user else 0
-        name = user.full_name if user else "Гость"
-
-        payload = sp.invoice_payload or ""
-        amount = sp.total_amount or 0
-        code = "unknown"
-        if payload.startswith("gift:"):
-            parts = payload.split(":")
-            if len(parts) >= 2:
-                code = parts[1]
-
-        title, _, sticker_key = GIFTS.get(code, (f"Подарок ({code})", amount, "happy"))
-
-        # сохраняем транзакцию
-        with SessionLocal() as s:
-            _get_or_create_memory(s, uid, name)
-            gt = GiftTransaction(
-                user_id=uid, gift_code=code, title=title,
-                amount_stars=amount, payload=payload
-            )
-            s.add(gt)
-            s.commit()
-
-        # благодарность + тост + стикер
-        thanks = f"Спасибо за подарок! *{title}* — это так мило 🥰\n" \
-                 f"Поднимаю бокал за тебя! За щедрость и за классное настроение! 🥂"
-        await update.message.reply_text(thanks, parse_mode="Markdown")
-
-        st_id = STICKERS.get(sticker_key)
-        if st_id:
-            await context.bot.send_sticker(chat_id=update.effective_chat.id, sticker=st_id)
-        else:
-            if STICKERS.get("happy"):
-                await context.bot.send_sticker(chat_id=update.effective_chat.id, sticker=STICKERS["happy"])
-
-        log.info("Gift received: user=%s code=%s stars=%s payload=%s", uid, code, amount, payload)
-    except Exception as e:
-        log.exception("successful_payment_handler failed: %s", e)
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Основной обработчик текста: сохраняет историю, реагирует на напитки,
-    иногда сама инициирует тост со стикером, и генерит общий ответ.
-    """
-    try:
-        if not update.message:
-            return
-        user = update.effective_user
-        uid = user.id if user else 0
-        name = user.full_name if user else "Гость"
-        text = update.message.text or ""
-
-        # Сохраним историю
-        with SessionLocal() as s:
-            mem = _save_message(s, uid, name, text)
-
-            low = text.lower()
-            if "мой любимый" in low and ("пиво" in low or "вино" in low or "виски" in low or "водк" in low or "шампан" in low):
-                fav = text.split("—", 1)[-1].strip() if "—" in text else (
-                    text.split(":", 1)[-1].strip() if ":" in text else None
-                )
-                mem.favorite_drink = fav or mem.favorite_drink or "без уточнений"
-                s.commit()
-                await update.message.reply_text(f"Запомнила! Твой любимый напиток: {mem.favorite_drink}")
-
-            drink = _detect_drink(text)
-            if drink:
-                st_id = STICKERS.get(drink)
-                if st_id:
-                    await context.bot.send_sticker(chat_id=update.effective_chat.id, sticker=st_id)
-                await update.message.reply_text("За нас! 🍻 Давай поддерживать хорошее настроение!")
-
-            if not drink and _should_katya_initiate_toast():
-                rnd = random.choice(["beer", "wine", "whiskey", "vodka"])
-                st = STICKERS.get(rnd)
-                if st:
-                    await context.bot.send_sticker(chat_id=update.effective_chat.id, sticker=st)
-                await update.message.reply_text("Я первая поднимаю бокал! 🥂 Тост за приятную беседу!")
-
-            reply = await generate_reply(text, mem)
-            await update.message.reply_text(reply)
-            _save_bot_reply(s, mem, reply)
-
-    except Exception as e:
-        log.exception("handle_message failed: %s", e)
-        try:
-            await update.effective_chat.send_message(
-                "У меня небольшая заминка 🙈 Попробуй повторить, а я всё быстро починю."
-            )
-        except Exception:
-            pass
-
-# --- FastAPI + Webhook ---
-
+# -----------------------------------------------------------------------------
+# Telegram Bot
+# -----------------------------------------------------------------------------
+tapp: Optional[Application] = None
 app = FastAPI()
 
+# Модели FastAPI
+class WebhookUpdate(BaseModel):
+    update_id: int
+    message: Optional[dict] = None
+    edited_message: Optional[dict] = None
+    channel_post: Optional[dict] = None
+    edited_channel_post: Optional[dict] = None
+    inline_query: Optional[dict] = None
+    chosen_inline_result: Optional[dict] = None
+    callback_query: Optional[dict] = None
+    shipping_query: Optional[dict] = None
+    pre_checkout_query: Optional[dict] = None
+    poll: Optional[dict] = None
+    poll_answer: Optional[dict] = None
+    my_chat_member: Optional[dict] = None
+    chat_member: Optional[dict] = None
+    chat_join_request: Optional[dict] = None
+
+# Команды
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if not chat:
+        return
+
+    with SessionLocal() as session:
+        get_or_create_user(
+            session,
+            chat_id=chat.id,
+            username=update.effective_user.username if update.effective_user else None,
+            first_name=update.effective_user.first_name if update.effective_user else None,
+            last_name=update.effective_user.last_name if update.effective_user else None,
+        )
+        session.commit()
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Купить напиток (1⭐)", callback_data="open_shop")],
+    ])
+    await update.message.reply_text(
+        "Привет! Я твой Drinking Buddy 🍻\nМожешь писать мне, а можешь купить напиток за звёзды.",
+        reply_markup=kb
+    )
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "/start — начать\n"
+        "/shop — магазин напитков за звезды (каждый по 1⭐)\n"
+        "Просто напиши сообщение — я отвечу 🙂"
+    )
+
+async def shop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Выбери напиток:", reply_markup=build_drinks_keyboard())
+
+async def open_shop_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q:
+        await q.answer()
+        await q.message.edit_text("Выбери напиток:", reply_markup=build_drinks_keyboard())
+
+async def buy_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Клик по кнопке 'buy:<slug>' — выставляем инвойс на 1⭐.
+       Если PAYMENT_PROVIDER_TOKEN не задан, аккуратно сообщаем и ничего не ломаем."""
+    q = update.callback_query
+    if not q:
+        return
+    await q.answer()
+
+    slug = q.data.split(":", 1)[1] if q.data and ":" in q.data else ""
+    drink = find_drink(slug)
+    if not drink:
+        await q.message.reply_text("Не нашёл такой напиток 🙈")
+        return
+
+    if not PAYMENT_PROVIDER_TOKEN:
+        await q.message.reply_text("Оплата звёздами сейчас недоступна. Попробуй позже 🙏")
+        return
+
+    _, title, price_stars = drink
+    # Для звёзд в Telegram цена — это просто '1' звезда. Валюта XTR.
+    prices = [LabeledPrice(label=title, amount=price_stars)]  # 1 "звезда-копейка"
+
+    payload = f"drink:{slug}"
+    try:
+        await q.message.reply_invoice(
+            title=f"Покупка: {title}",
+            description="Каждый напиток стоит 1⭐",
+            payload=payload,
+            provider_token=PAYMENT_PROVIDER_TOKEN,
+            currency="XTR",
+            prices=prices,
+        )
+    except Exception as e:
+        log.exception("Failed to send invoice: %s", e)
+        await q.message.reply_text("Не удалось создать счёт. Попробуй позже 🙏")
+
+async def precheckout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подтверждаем pre_checkout (обязательно для платежей)."""
+    query = update.pre_checkout_query
+    try:
+        await query.answer(ok=True)
+    except Exception as e:
+        log.exception("PreCheckout error: %s", e)
+
+async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Финализируем покупку: записываем транзакцию и поздравляем."""
+    msg = update.message
+    sp = msg.successful_payment
+    chat = update.effective_chat
+
+    payload = sp.invoice_payload if sp else None
+    total_amount = sp.total_amount if sp else 0
+    charge_id = sp.telegram_payment_charge_id if sp else None
+    currency = sp.currency if sp else "XTR"
+
+    with SessionLocal() as session:
+        user = get_or_create_user(
+            session,
+            chat_id=chat.id,
+            username=update.effective_user.username if update.effective_user else None,
+            first_name=update.effective_user.first_name if update.effective_user else None,
+            last_name=update.effective_user.last_name if update.effective_user else None,
+        )
+        tx = GiftTransaction(
+            user_id=user.id,
+            tg_payment_charge_id=charge_id,
+            payload=payload,
+            total_amount=total_amount,
+            currency=currency,
+            status="successful",
+            raw=msg.to_dict() if msg else None,
+        )
+        session.add(tx)
+        session.commit()
+
+    # вычесть звезду локально мы не можем — баланс хранится у Telegram;
+    # факт покупки зафиксирован, отправим подтверждение:
+    title = "напиток"
+    if payload and payload.startswith("drink:"):
+        slug = payload.split(":", 1)[1]
+        d = find_drink(slug)
+        if d:
+            title = d[1]
+    await msg.reply_text(f"Спасибо за покупку! {title} оформлен ✅")
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Основной чат — не должен страдать из-за оплат."""
+    text = update.message.text or ""
+    try:
+        reply = await ask_llm(text)
+    except Exception as e:
+        log.exception("LLM error: %s", e)
+        reply = "Ой, что-то пошло не так. Попробуй ещё раз 🙏"
+    await update.message.reply_text(reply)
+
+
+def build_bot() -> Application:
+    if not BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN is not set")
+
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # Команды
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_cmd))
+    application.add_handler(CommandHandler("shop", shop_cmd))
+
+    # Кнопки магазина
+    application.add_handler(CallbackQueryHandler(open_shop_cb, pattern="^open_shop$"))
+    application.add_handler(CallbackQueryHandler(buy_cb, pattern="^buy:"))
+
+    # Платежи (эти хендлеры НЕ ломают основной функционал при ошибках — регистрация ниже в on_startup)
+    # Простой текст — всегда в самом конце
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    return application
+
+
+# -----------------------------------------------------------------------------
+# FastAPI + webhook
+# -----------------------------------------------------------------------------
 @app.on_event("startup")
 async def on_startup():
-    try:
-        await tapp.initialize()
+    global tapp
+    init_db()
 
-        tapp.add_handler(CommandHandler("start", start))
-        tapp.add_handler(CommandHandler("gift", gift_command))
-        tapp.add_handler(CallbackQueryHandler(gift_select, pattern=r"^gift:"))
+    try:
+        tapp = build_bot()
+
+        # Платёжные хендлеры подключаем тут и защищаемся от ошибок
         tapp.add_handler(PreCheckoutQueryHandler(precheckout_handler))
-        tapp.add_handler(MessageHandler(filters.StatusUpdate.SUCCESSFUL_PAYMENT, successful_payment_handler))
+        tapp.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
         tapp.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+        # Ставим вебхук
         if BOT_TOKEN and APP_BASE_URL:
             wh_url = f"{APP_BASE_URL}/webhook/{BOT_TOKEN}"
             await tapp.bot.set_webhook(url=wh_url, allowed_updates=["message", "callback_query", "pre_checkout_query"])
@@ -392,19 +368,19 @@ async def on_startup():
 
 @app.get("/", response_class=PlainTextResponse)
 async def health():
-    return "ok"
+    return "OK"
 
-@app.post("/webhook/{token}", response_class=PlainTextResponse)
-async def telegram_webhook(token: str, request: Request):
+@app.post("/webhook/{token}")
+async def telegram_webhook(token: str, request: Request, x_telegram_bot_api_secret_token: Optional[str] = Header(None)):
     if token != BOT_TOKEN:
-        return PlainTextResponse("forbidden", status_code=403)
-    try:
-        data = await request.json()
-        upd_id = data.get("update_id")
-        log.info("Incoming update_id=%s", upd_id)
-        update = Update.de_json(data=data, bot=tapp.bot)
-        await tapp.process_update(update)
-        return "ok"
-    except Exception as e:
-        log.exception("Webhook error: %s", e)
-        return "ok"
+        return JSONResponse({"ok": False, "error": "wrong token"}, status_code=403)
+
+    data = await request.json()
+    log.info("Incoming update_id=%s", data.get("update_id"))
+
+    if not tapp:
+        return JSONResponse({"ok": False, "error": "bot not started"}, status_code=503)
+
+    update = Update.de_json(data, tapp.bot)
+    await tapp.process_update(update)
+    return JSONResponse({"ok": True})
