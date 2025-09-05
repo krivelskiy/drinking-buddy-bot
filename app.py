@@ -37,7 +37,7 @@ logging.basicConfig(
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-# ✅ Читаем токен из любого привычного имени
+# читаем токен из любого удобного имени
 BOT_TOKEN = (
     os.getenv("BOT_TOKEN")
     or os.getenv("TELEGRAM_BOT_TOKEN")
@@ -46,7 +46,7 @@ BOT_TOKEN = (
     or ""
 )
 
-APP_BASE_URL = os.getenv("APP_BASE_URL", "")  # например: https://drinking-buddy-bot.onrender.com
+APP_BASE_URL = os.getenv("APP_BASE_URL", "")  # напр.: https://drinking-buddy-bot.onrender.com
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./db.sqlite3")
 PAYMENT_PROVIDER_TOKEN = os.getenv("PAYMENT_PROVIDER_TOKEN", "")
 
@@ -100,7 +100,7 @@ def init_db():
 
 
 # -----------------------------------------------------------------------------
-# OpenAI — заглушка, чтобы чат жил независимо от оплат
+# OpenAI — заглушка: чат не зависит от оплат
 # -----------------------------------------------------------------------------
 async def ask_llm(prompt: str) -> str:
     return f"🤖 {prompt}"
@@ -312,7 +312,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def build_bot() -> Optional[Application]:
     if not BOT_TOKEN:
-        # не падаем — просто вернём None; чат и оплаты не стартуют без токена
         return None
 
     application = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -325,40 +324,64 @@ def build_bot() -> Optional[Application]:
     application.add_handler(CallbackQueryHandler(open_shop_cb, pattern="^open_shop$"))
     application.add_handler(CallbackQueryHandler(buy_cb, pattern="^buy:"))
 
-    # Текст — в самом конце
+    # текст — в конце
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # платёжные хендлеры добавим после инициализации в on_startup
     return application
 
 
 # -----------------------------------------------------------------------------
 # FastAPI + webhook
 # -----------------------------------------------------------------------------
+tapp_initialized = False
+
 @app.on_event("startup")
 async def on_startup():
-    global tapp
+    global tapp, tapp_initialized
     init_db()
     try:
         tapp = build_bot()
 
         if tapp:
-            # Платежные хендлеры (не ломают старт, обрабатываются отдельно)
+            # инициализация и запуск PTB-приложения (обязательно для process_update)
+            await tapp.initialize()
+
+            # платёжные хендлеры (после initialize, до start)
             tapp.add_handler(PreCheckoutQueryHandler(precheckout_handler))
+            # В PTB 20.6 корректный фильтр:
             tapp.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
 
-            # Ставим вебхук
+            # ставим вебхук
             if APP_BASE_URL:
                 wh_url = f"{APP_BASE_URL}/webhook/{BOT_TOKEN}"
                 await tapp.bot.set_webhook(
                     url=wh_url,
-                    allowed_updates=["message", "callback_query", "pre_checkout_query"],
+                    allowed_updates=["message", "callback_query", "pre_checkout_query", "successful_payment"],
                 )
                 log.info("✅ Webhook set to %s", wh_url)
             else:
                 log.warning("Webhook not set: APP_BASE_URL is empty")
+
+            # запускаем PTB (иначе RuntimeError при process_update)
+            await tapp.start()
+            tapp_initialized = True
         else:
             log.error("Startup note: BOT_TOKEN is empty — бот не инициализирован.")
     except Exception as e:
         log.exception("Startup failed: %s", e)
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    global tapp, tapp_initialized
+    if tapp and tapp_initialized:
+        try:
+            await tapp.stop()
+            await tapp.shutdown()
+        except Exception as e:
+            log.exception("Shutdown error: %s", e)
+        finally:
+            tapp_initialized = False
 
 @app.get("/", response_class=PlainTextResponse)
 async def health():
@@ -366,14 +389,11 @@ async def health():
 
 @app.post("/webhook/{token}")
 async def telegram_webhook(token: str, request: Request, x_telegram_bot_api_secret_token: Optional[str] = Header(None)):
-    # если токен не задан — бот не поднят
     if not BOT_TOKEN:
         return JSONResponse({"ok": False, "error": "bot token not configured"}, status_code=503)
-    # защита: в пути должен быть именно токен бота
     if token != BOT_TOKEN:
         return JSONResponse({"ok": False, "error": "wrong token"}, status_code=403)
-
-    if not tapp:
+    if not tapp or not tapp_initialized:
         return JSONResponse({"ok": False, "error": "bot not started"}, status_code=503)
 
     data = await request.json()
