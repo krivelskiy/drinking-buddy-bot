@@ -1,9 +1,8 @@
 # app.py
 import os
-import json
 import logging
 from datetime import datetime, timezone
-from typing import Optional, List, Tuple
+from typing import Optional, Tuple, List
 
 from fastapi import FastAPI, Request, Header
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -11,10 +10,8 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 
 import sqlalchemy as sa
-from sqlalchemy import String, BigInteger, Integer, DateTime, JSON, ForeignKey, Text
+from sqlalchemy import String, BigInteger, Integer, DateTime, JSON, ForeignKey
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
-
-import httpx
 
 from telegram import (
     Update,
@@ -39,7 +36,16 @@ logging.basicConfig(
 )
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+
+# ✅ Читаем токен из любого привычного имени
+BOT_TOKEN = (
+    os.getenv("BOT_TOKEN")
+    or os.getenv("TELEGRAM_BOT_TOKEN")
+    or os.getenv("TELEGRAM_TOKEN")
+    or os.getenv("TELEGRAM_API_TOKEN")
+    or ""
+)
+
 APP_BASE_URL = os.getenv("APP_BASE_URL", "")  # например: https://drinking-buddy-bot.onrender.com
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./db.sqlite3")
 PAYMENT_PROVIDER_TOKEN = os.getenv("PAYMENT_PROVIDER_TOKEN", "")
@@ -47,7 +53,7 @@ PAYMENT_PROVIDER_TOKEN = os.getenv("PAYMENT_PROVIDER_TOKEN", "")
 if not OPENAI_API_KEY:
     log.warning("OPENAI_API_KEY is empty")
 if not BOT_TOKEN:
-    log.warning("TELEGRAM_TOKEN is empty (webhook/бот работать не будет)")
+    log.warning("BOT_TOKEN is empty (webhook/бот работать не будет)")
 if not APP_BASE_URL:
     log.warning("APP_BASE_URL is empty (webhook не будет установлен)")
 
@@ -68,9 +74,6 @@ class User(Base):
     created_at = sa.Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
     updated_at = sa.Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
-    # баланс звёзд мы не учитываем локально (звёзды — валюта Telegram).
-    # Но фиксируем покупки напитков/подарков в отдельной таблице.
-
     transactions = relationship("GiftTransaction", back_populates="user", cascade="all, delete-orphan")
 
 
@@ -78,11 +81,11 @@ class GiftTransaction(Base):
     __tablename__ = "gift_transactions"
     id = sa.Column(Integer, primary_key=True)
     user_id = sa.Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    tg_payment_charge_id = sa.Column(String(255), nullable=True)  # id чека из Telegram
-    payload = sa.Column(String(255), nullable=True)               # что покупали
-    total_amount = sa.Column(Integer, nullable=False, default=0)  # в минимальных единицах (копейки/стар-копейки)
-    currency = sa.Column(String(10), nullable=False, default="XTR")  # для звёзд формально "XTR"
-    status = sa.Column(String(32), nullable=False, default="pending")  # pending, successful, failed
+    tg_payment_charge_id = sa.Column(String(255), nullable=True)
+    payload = sa.Column(String(255), nullable=True)
+    total_amount = sa.Column(Integer, nullable=False, default=0)
+    currency = sa.Column(String(10), nullable=False, default="XTR")
+    status = sa.Column(String(32), nullable=False, default="pending")
     raw = sa.Column(JSON, nullable=True)
 
     created_at = sa.Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
@@ -97,10 +100,9 @@ def init_db():
 
 
 # -----------------------------------------------------------------------------
-# OpenAI (заглушка под ваш текущий диалоговый обработчик)
+# OpenAI — заглушка, чтобы чат жил независимо от оплат
 # -----------------------------------------------------------------------------
 async def ask_llm(prompt: str) -> str:
-    # здесь ваш вызов OpenAI; оставляем простую заглушку чтобы не мешать работе
     return f"🤖 {prompt}"
 
 
@@ -120,7 +122,6 @@ def get_or_create_user(session, chat_id: int, username: Optional[str], first_nam
         session.flush()
         log.info("Created user chat_id=%s id=%s", chat_id, user.id)
     else:
-        # мягко обновим видимые поля (без обязательных commit'ов если не менялись)
         changed = False
         if user.username != username:
             user.username = username; changed = True
@@ -134,10 +135,9 @@ def get_or_create_user(session, chat_id: int, username: Optional[str], first_nam
 
 
 # -----------------------------------------------------------------------------
-# Логика подарков/покупки напитков за звезды
+# Магазин напитков за звезды
 # -----------------------------------------------------------------------------
-# Каждый напиток — 1 звезда. Реализуем простое меню и платёж через звезды.
-DRINKS = [
+DRINKS: List[Tuple[str, str, int]] = [
     ("espresso", "Эспрессо ☕", 1),
     ("latte", "Латте 🥛☕", 1),
     ("beer", "Пиво 🍺", 1),
@@ -163,25 +163,19 @@ def find_drink(slug: str) -> Optional[Tuple[str, str, int]]:
 tapp: Optional[Application] = None
 app = FastAPI()
 
-# Модели FastAPI
 class WebhookUpdate(BaseModel):
     update_id: int
     message: Optional[dict] = None
     edited_message: Optional[dict] = None
     channel_post: Optional[dict] = None
     edited_channel_post: Optional[dict] = None
-    inline_query: Optional[dict] = None
-    chosen_inline_result: Optional[dict] = None
     callback_query: Optional[dict] = None
-    shipping_query: Optional[dict] = None
     pre_checkout_query: Optional[dict] = None
-    poll: Optional[dict] = None
-    poll_answer: Optional[dict] = None
     my_chat_member: Optional[dict] = None
     chat_member: Optional[dict] = None
     chat_join_request: Optional[dict] = None
 
-# Команды
+# ----- Хендлеры
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if not chat:
@@ -197,23 +191,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         session.commit()
 
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Купить напиток (1⭐)", callback_data="open_shop")],
-    ])
-    await update.message.reply_text(
-        "Привет! Я твой Drinking Buddy 🍻\nМожешь писать мне, а можешь купить напиток за звёзды.",
-        reply_markup=kb
-    )
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Купить напиток (1⭐)", callback_data="open_shop")]])
+    if update.message:
+        await update.message.reply_text(
+            "Привет! Я твой Drinking Buddy 🍻\nМожешь написать мне что-нибудь или купить напиток за звёзды.",
+            reply_markup=kb
+        )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "/start — начать\n"
-        "/shop — магазин напитков за звезды (каждый по 1⭐)\n"
-        "Просто напиши сообщение — я отвечу 🙂"
-    )
+    if update.message:
+        await update.message.reply_text(
+            "/start — начать\n"
+            "/shop — магазин напитков за звезды (каждый по 1⭐)\n"
+            "/ping — проверка живости\n"
+            "Просто напиши сообщение — я отвечу 🙂"
+        )
+
+async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message:
+        await update.message.reply_text("pong ✅")
 
 async def shop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Выбери напиток:", reply_markup=build_drinks_keyboard())
+    if update.message:
+        await update.message.reply_text("Выбери напиток:", reply_markup=build_drinks_keyboard())
 
 async def open_shop_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -222,8 +222,6 @@ async def open_shop_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.edit_text("Выбери напиток:", reply_markup=build_drinks_keyboard())
 
 async def buy_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Клик по кнопке 'buy:<slug>' — выставляем инвойс на 1⭐.
-       Если PAYMENT_PROVIDER_TOKEN не задан, аккуратно сообщаем и ничего не ломаем."""
     q = update.callback_query
     if not q:
         return
@@ -240,8 +238,7 @@ async def buy_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     _, title, price_stars = drink
-    # Для звёзд в Telegram цена — это просто '1' звезда. Валюта XTR.
-    prices = [LabeledPrice(label=title, amount=price_stars)]  # 1 "звезда-копейка"
+    prices = [LabeledPrice(label=title, amount=price_stars)]  # 1⭐
 
     payload = f"drink:{slug}"
     try:
@@ -258,7 +255,6 @@ async def buy_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("Не удалось создать счёт. Попробуй позже 🙏")
 
 async def precheckout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Подтверждаем pre_checkout (обязательно для платежей)."""
     query = update.pre_checkout_query
     try:
         await query.answer(ok=True)
@@ -266,9 +262,8 @@ async def precheckout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         log.exception("PreCheckout error: %s", e)
 
 async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Финализируем покупку: записываем транзакцию и поздравляем."""
     msg = update.message
-    sp = msg.successful_payment
+    sp = msg.successful_payment if msg else None
     chat = update.effective_chat
 
     payload = sp.invoice_payload if sp else None
@@ -284,7 +279,7 @@ async def successful_payment_handler(update: Update, context: ContextTypes.DEFAU
             first_name=update.effective_user.first_name if update.effective_user else None,
             last_name=update.effective_user.last_name if update.effective_user else None,
         )
-        tx = GiftTransaction(
+        session.add(GiftTransaction(
             user_id=user.id,
             tg_payment_charge_id=charge_id,
             payload=payload,
@@ -292,51 +287,46 @@ async def successful_payment_handler(update: Update, context: ContextTypes.DEFAU
             currency=currency,
             status="successful",
             raw=msg.to_dict() if msg else None,
-        )
-        session.add(tx)
+        ))
         session.commit()
 
-    # вычесть звезду локально мы не можем — баланс хранится у Telegram;
-    # факт покупки зафиксирован, отправим подтверждение:
     title = "напиток"
     if payload and payload.startswith("drink:"):
         slug = payload.split(":", 1)[1]
         d = find_drink(slug)
         if d:
             title = d[1]
-    await msg.reply_text(f"Спасибо за покупку! {title} оформлен ✅")
-
+    if msg:
+        await msg.reply_text(f"Спасибо за покупку! {title} оформлен ✅")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Основной чат — не должен страдать из-за оплат."""
-    text = update.message.text or ""
+    text = (update.message.text or "") if update.message else ""
     try:
         reply = await ask_llm(text)
     except Exception as e:
         log.exception("LLM error: %s", e)
         reply = "Ой, что-то пошло не так. Попробуй ещё раз 🙏"
-    await update.message.reply_text(reply)
+    if update.message:
+        await update.message.reply_text(reply)
 
 
-def build_bot() -> Application:
+def build_bot() -> Optional[Application]:
     if not BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_TOKEN is not set")
+        # не падаем — просто вернём None; чат и оплаты не стартуют без токена
+        return None
 
     application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Команды
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_cmd))
+    application.add_handler(CommandHandler("ping", ping_cmd))
     application.add_handler(CommandHandler("shop", shop_cmd))
 
-    # Кнопки магазина
     application.add_handler(CallbackQueryHandler(open_shop_cb, pattern="^open_shop$"))
     application.add_handler(CallbackQueryHandler(buy_cb, pattern="^buy:"))
 
-    # Платежи (эти хендлеры НЕ ломают основной функционал при ошибках — регистрация ниже в on_startup)
-    # Простой текст — всегда в самом конце
+    # Текст — в самом конце
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
     return application
 
 
@@ -347,22 +337,26 @@ def build_bot() -> Application:
 async def on_startup():
     global tapp
     init_db()
-
     try:
         tapp = build_bot()
 
-        # Платёжные хендлеры подключаем тут и защищаемся от ошибок
-        tapp.add_handler(PreCheckoutQueryHandler(precheckout_handler))
-        tapp.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
-        tapp.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        if tapp:
+            # Платежные хендлеры (не ломают старт, обрабатываются отдельно)
+            tapp.add_handler(PreCheckoutQueryHandler(precheckout_handler))
+            tapp.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
 
-        # Ставим вебхук
-        if BOT_TOKEN and APP_BASE_URL:
-            wh_url = f"{APP_BASE_URL}/webhook/{BOT_TOKEN}"
-            await tapp.bot.set_webhook(url=wh_url, allowed_updates=["message", "callback_query", "pre_checkout_query"])
-            log.info("✅ Webhook set to %s", wh_url)
+            # Ставим вебхук
+            if APP_BASE_URL:
+                wh_url = f"{APP_BASE_URL}/webhook/{BOT_TOKEN}"
+                await tapp.bot.set_webhook(
+                    url=wh_url,
+                    allowed_updates=["message", "callback_query", "pre_checkout_query"],
+                )
+                log.info("✅ Webhook set to %s", wh_url)
+            else:
+                log.warning("Webhook not set: APP_BASE_URL is empty")
         else:
-            log.warning("Webhook not set (no BOT_TOKEN/APP_BASE_URL)")
+            log.error("Startup note: BOT_TOKEN is empty — бот не инициализирован.")
     except Exception as e:
         log.exception("Startup failed: %s", e)
 
@@ -372,14 +366,18 @@ async def health():
 
 @app.post("/webhook/{token}")
 async def telegram_webhook(token: str, request: Request, x_telegram_bot_api_secret_token: Optional[str] = Header(None)):
+    # если токен не задан — бот не поднят
+    if not BOT_TOKEN:
+        return JSONResponse({"ok": False, "error": "bot token not configured"}, status_code=503)
+    # защита: в пути должен быть именно токен бота
     if token != BOT_TOKEN:
         return JSONResponse({"ok": False, "error": "wrong token"}, status_code=403)
 
-    data = await request.json()
-    log.info("Incoming update_id=%s", data.get("update_id"))
-
     if not tapp:
         return JSONResponse({"ok": False, "error": "bot not started"}, status_code=503)
+
+    data = await request.json()
+    log.info("Incoming update_id=%s", data.get("update_id"))
 
     update = Update.de_json(data, tapp.bot)
     await tapp.process_update(update)
