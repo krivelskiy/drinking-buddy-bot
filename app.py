@@ -141,7 +141,13 @@ def build_application() -> Application:
         raise RuntimeError("BOT_TOKEN is not set")
     app_ = Application.builder().token(BOT_TOKEN).build()
 
+    # Добавляем обработчики
+    app_.add_handler(CommandHandler("gift", gift_command))
+    app_.add_handler(CallbackQueryHandler(gift_callback, pattern="^gift_"))
+    app_.add_handler(PreCheckoutQueryHandler(pre_checkout_query))
+    app_.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
     app_.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_handler))
+    
     return app_
 
 # -----------------------------
@@ -486,7 +492,7 @@ async def gift_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     drink_info = {
         "gift_wine": {"name": "🍷 Вино", "stars": 1, "sticker": "[SEND_DRINK_WINE]"},
         "gift_vodka": {"name": "🍸 Водка", "stars": 1, "sticker": "[SEND_DRINK_VODKA]"},
-        "gift_whisky": {"name": "�� Виски", "stars": 1, "sticker": "[SEND_DRINK_WHISKY]"},
+        "gift_whisky": {"name": "🥃 Виски", "stars": 1, "sticker": "[SEND_DRINK_WHISKY]"},
         "gift_beer": {"name": "🍺 Пиво", "stars": 1, "sticker": "[SEND_DRINK_BEER]"}
     }
     
