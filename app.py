@@ -4,6 +4,8 @@ import re
 import logging
 from datetime import datetime
 from typing import Optional
+import asyncio
+from datetime import datetime, timedelta
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
@@ -143,7 +145,30 @@ if not BOT_TOKEN:
 
 tapp: Optional[Application] = None
 
+async def ping_scheduler():
+    """Ping-бот для предотвращения засыпания приложения на Render"""
+    while True:
+        try:
+            # Отправляем ping каждые 10 минут
+            await asyncio.sleep(600)  # 10 минут
+            
+            # Логируем ping
+            logger.info("🔄 Ping: keeping app alive")
+            
+            # Можно добавить HTTP запрос к самому себе
+            async with httpx.AsyncClient() as client:
+                try:
+                    response = await client.get("https://drinking-buddy-bot.onrender.com/")
+                    logger.info(f"✅ Self-ping successful: {response.status_code}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Self-ping failed: {e}")
+                    
+        except Exception as e:
+            logger.exception(f"❌ Ping scheduler error: {e}")
+            await asyncio.sleep(60)  # Ждем минуту перед повтором
+
 def build_application() -> Application:
+    """Создает и настраивает приложение"""
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is not set")
     app_ = Application.builder().token(BOT_TOKEN).build()
@@ -154,6 +179,9 @@ def build_application() -> Application:
     app_.add_handler(PreCheckoutQueryHandler(pre_checkout_query))
     app_.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
     app_.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_handler))
+    
+    # Запускаем ping-бот в фоне
+    asyncio.create_task(ping_scheduler())
     
     return app_
 
