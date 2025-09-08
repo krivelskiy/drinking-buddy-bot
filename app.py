@@ -2,6 +2,10 @@ import os
 import httpx
 import re
 import logging
+import traceback
+from functools import wraps
+import time
+from collections import defaultdict
 from datetime import datetime
 from typing import Optional
 import asyncio
@@ -24,6 +28,63 @@ from constants import (
     STICKERS, DRINK_KEYWORDS, DB_FIELDS, FALLBACK_OPENAI_UNAVAILABLE,
     USERS_TABLE, MESSAGES_TABLE, BEER_STICKERS, STICKER_TRIGGERS
 )
+
+# -----------------------------
+# Система безопасности и мониторинга
+# -----------------------------
+
+# Счетчики ошибок для мониторинга
+error_counts = defaultdict(int)
+last_error_time = defaultdict(float)
+
+def safe_execute(func):
+    """Декоратор для безопасного выполнения функций"""
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            error_counts[func.__name__] += 1
+            last_error_time[func.__name__] = time.time()
+            logger.exception(f"Critical error in {func.__name__}: {e}")
+            
+            # Отправляем уведомление о критической ошибке
+            await notify_critical_error(func.__name__, str(e))
+            
+            # Возвращаем безопасный fallback
+            return get_fallback_response(func.__name__)
+    return wrapper
+
+def safe_execute_sync(func):
+    """Декоратор для безопасного выполнения синхронных функций"""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            error_counts[func.__name__] += 1
+            last_error_time[func.__name__] = time.time()
+            logger.exception(f"Critical error in {func.__name__}: {e}")
+            return get_fallback_response(func.__name__)
+    return wrapper
+
+async def notify_critical_error(function_name: str, error: str) -> None:
+    """Уведомление о критической ошибке (можно отправить в мониторинг)"""
+    try:
+        logger.critical(f"CRITICAL ERROR in {function_name}: {error}")
+        # Здесь можно добавить отправку в Slack, Telegram, Sentry и т.д.
+    except Exception:
+        pass  # Не падаем из-за ошибки в уведомлении
+
+def get_fallback_response(function_name: str) -> str:
+    """Безопасный fallback ответ"""
+    fallbacks = {
+        "llm_reply": "Извини, у меня сейчас технические проблемы. Попробуй позже! 😅",
+        "msg_handler": None,  # Не отправляем ответ при ошибке в обработчике
+        "send_auto_messages": None,  # Пропускаем автоматические сообщения
+        "ping_scheduler": None,  # Пропускаем ping
+    }
+    return fallbacks.get(function_name, "Что-то пошло не так. Попробуй еще раз! 🤔")
 
 # -----------------------------
 # Утилиты БД
@@ -1256,10 +1317,6 @@ async def on_shutdown():
 # -----------------------------
 # Система безопасности и мониторинга
 # -----------------------------
-import traceback
-from functools import wraps
-import time
-from collections import defaultdict
 
 # Счетчики ошибок для мониторинга
 error_counts = defaultdict(int)
