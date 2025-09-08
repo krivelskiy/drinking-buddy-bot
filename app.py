@@ -320,6 +320,15 @@ def load_context() -> str:
 
 SYSTEM_PROMPT = load_context()
 
+def get_user_name(user_tg_id: int) -> Optional[str]:
+    """Получение имени пользователя из БД"""
+    with engine.begin() as conn:
+        row = conn.execute(
+            text(f"SELECT {U['first_name']} FROM {USERS_TABLE} WHERE {U['user_tg_id']} = :tg_id"),
+            {"tg_id": user_tg_id},
+        ).fetchone()
+        return row[0] if row and row[0] else None
+
 async def llm_reply(user_text: str, username: Optional[str], user_tg_id: int, chat_id: int) -> tuple[str, Optional[str]]:
     """
     Генерирует ответ LLM и возвращает (ответ, команда_стикера_или_None)
@@ -341,25 +350,23 @@ async def llm_reply(user_text: str, username: Optional[str], user_tg_id: int, ch
         # Добавляем информацию о пользователе
         if user_age:
             messages.append({"role": "system", "content": f"Пользователю {user_age} лет."})
-        if username:
-            messages.append({"role": "system", "content": f"Username пользователя: @{username}"})
+        
+        # Получаем имя пользователя из БД для более точного обращения
+        user_name = get_user_name(user_tg_id)
+        if user_name:
+            messages.append({"role": "system", "content": f"Имя пользователя: {user_name}. Обращайся к нему по имени, а не по username."})
         
         # Добавляем инструкцию о стикерах
         messages.append({"role": "system", "content": """
-ВАЖНО: Если в контексте разговора уместно отправить стикер, добавь в конец ответа одну из команд:
+СТИКЕРЫ: Если пьете алкоголь или тостите, добавь в конец ответа:
+- [SEND_DRINK_WINE] для вина
+- [SEND_DRINK_VODKA] для водки  
+- [SEND_DRINK_WHISKY] для виски
+- [SEND_DRINK_BEER] для пива
+- [SEND_KATYA_HAPPY] когда радуешься
+- [SEND_KATYA_SAD] когда грустишь
 
-СТИКЕРЫ АЛКОГОЛЯ (когда пьете, тостите, предлагаете выпить):
-- [SEND_DRINK_VODKA] - для водки
-- [SEND_DRINK_WHISKY] - для виски  
-- [SEND_DRINK_WINE] - для вина
-- [SEND_DRINK_BEER] - для пива
-
-СТИКЕРЫ НАСТРОЕНИЯ (когда радуетесь или грустите):
-- [SEND_KATYA_HAPPY] - когда весело, радостно, флиртуете
-- [SEND_KATYA_SAD] - когда грустно, скучно, тоскуете
-
-Эти команды будут автоматически удалены из ответа пользователю.
-Используй стикеры естественно - когда действительно уместно по контексту!
+Команда будет удалена из ответа пользователю.
 """})
         
         # Добавляем историю сообщений (в обратном порядке для правильной последовательности)
@@ -368,7 +375,7 @@ async def llm_reply(user_text: str, username: Optional[str], user_tg_id: int, ch
         
         messages.append({"role": "user", "content": user_text})
         
-        logger.info(f"LLM request for user {user_tg_id}: {len(messages)} messages, age: {user_age}")
+        logger.info(f"LLM request for user {user_tg_id}: {len(messages)} messages, age: {user_age}, name: {user_name}")
 
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
