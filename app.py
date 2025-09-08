@@ -554,10 +554,18 @@ def build_conversation_context(recent_messages: list, user_text: str) -> list:
     
     return filtered_messages
 
+@safe_execute
 async def llm_reply(user_text: str, username: Optional[str], user_tg_id: int, chat_id: int) -> tuple[str, Optional[str]]:
-    """
-    Генерирует ответ LLM и возвращает (ответ, команда_стикера_или_None)
-    """
+    """Генерирует ответ LLM с защитой от ошибок"""
+    # Валидация входных данных
+    if not validate_user_input(user_text):
+        logger.warning(f"Invalid user input from {user_tg_id}")
+        return "Извини, не могу обработать это сообщение. Попробуй написать по-другому! 😅", None
+    
+    if not validate_user_id(user_tg_id) or not validate_chat_id(chat_id):
+        logger.warning(f"Invalid user_id or chat_id: {user_tg_id}, {chat_id}")
+        return "Произошла ошибка с данными. Попробуй еще раз! 😅", None
+    
     if client is None:
         return FALLBACK_OPENAI_UNAVAILABLE, None
     
@@ -635,31 +643,37 @@ async def llm_reply(user_text: str, username: Optional[str], user_tg_id: int, ch
         # АВТОМАТИЧЕСКОЕ ОПРЕДЕЛЕНИЕ СТИКЕРА ПО КОНТЕКСТУ
         sticker_command = None
         
-        # Проверяем упоминание алкоголя в ответе LLM
-        lower_response = response_text.lower()
-        if any(word in lower_response for word in ["вино", "винца", "винцо", "🍷"]):
-            sticker_command = "[SEND_DRINK_WINE]"
-        elif any(word in lower_response for word in ["водка", "водочка", "🍸"]):
-            sticker_command = "[SEND_DRINK_VODKA]"
-        elif any(word in lower_response for word in ["виски", "вискарь", "🥃"]):
-            sticker_command = "[SEND_DRINK_WHISKY]"
-        elif any(word in lower_response for word in ["пиво", "пивка", "🍺"]):
+        # Проверяем на ключевые слова для стикеров
+        response_lower = response_text.lower()
+        
+        # Стикеры алкоголя
+        if any(keyword in response_lower for keyword in ["🍺", "пиво", "beer", "пей", "выпей", "наливай"]):
             sticker_command = "[SEND_DRINK_BEER]"
-        elif any(word in lower_response for word in ["радость", "радуешься", "весело", "😊"]):
+        elif any(keyword in response_lower for keyword in ["🍷", "вино", "wine", "винца", "винцо"]):
+            sticker_command = "[SEND_DRINK_WINE]"
+        elif any(keyword in response_lower for keyword in ["🍸", "водка", "vodka", "водочка"]):
+            sticker_command = "[SEND_DRINK_VODKA]"
+        elif any(keyword in response_lower for keyword in ["🥃", "виски", "whisky", "вискарь"]):
+            sticker_command = "[SEND_DRINK_WHISKY]"
+        elif any(keyword in response_lower for keyword in ["🍾", "шампанское", "champagne"]):
+            sticker_command = "[SEND_DRINK_CHAMPAGNE]"
+        
+        # Стикеры Кати
+        elif any(keyword in response_lower for keyword in ["😘", "💋", "целую", "поцелуй"]):
+            sticker_command = "[SEND_KATYA_KISS]"
+        elif any(keyword in response_lower for keyword in ["😄", "😂", "смеюсь", "весело"]):
+            sticker_command = "[SEND_KATYA_LAUGH]"
+        elif any(keyword in response_lower for keyword in ["😊", "рада", "счастлива", "улыбка"]):
             sticker_command = "[SEND_KATYA_HAPPY]"
-        elif any(word in lower_response for word in ["грустно", "тоска", "😢"]):
-            sticker_command = "[SEND_KATYA_SAD]"
         
         if sticker_command:
             logger.info(f"Auto-detected sticker: {sticker_command} for user {user_tg_id}")
-        else:
-            logger.info(f"No sticker auto-detected for user {user_tg_id}")
         
         return response_text, sticker_command
         
     except Exception as e:
-        logger.exception("OpenAI error: %s", e)
-        return FALLBACK_OPENAI_UNAVAILABLE, None
+        logger.exception(f"LLM error for user {user_tg_id}: {e}")
+        return "У меня сейчас проблемы с ответом. Попробуй позже! 😅", None
 
 async def send_sticker_by_command(chat_id: int, sticker_command: str) -> None:
     """Отправка стикера по команде от LLM"""
@@ -884,8 +898,9 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # -----------------------------
 # Хендлер сообщений
 # -----------------------------
+@safe_execute
 async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик сообщений"""
+    """Обработчик сообщений с защитой"""
     if not update.message or not update.message.text:
         return
 
@@ -897,6 +912,20 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     message_id = update.message.message_id
 
     logger.info("Received message: %s from user %s", text_in, user_tg_id)
+
+    # Rate limiting
+    if not check_rate_limit(user_tg_id):
+        await update.message.reply_text("Слишком много сообщений! Подожди минуту 😅")
+        return
+    
+    # Валидация
+    if not validate_user_input(text_in):
+        await update.message.reply_text("Извини, не могу обработать это сообщение 😅")
+        return
+    
+    if not validate_user_id(user_tg_id) or not validate_chat_id(chat_id):
+        logger.warning(f"Invalid IDs: user={user_tg_id}, chat={chat_id}")
+        return
 
     # 1) Обновляем/создаем пользователя
     try:
@@ -934,30 +963,32 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # 5) Отправляем ответ
     try:
         sent_message = await update.message.reply_text(answer)
-    except Exception:
-        logger.exception("Failed to send reply")
-        return
-
-    # 6) Отправляем стикер если нужно
-    if sticker_command:
-        # Проверяем, может ли Катя выпить бесплатно
-        if can_katya_drink_free(chat_id):
-            await send_sticker_by_command(chat_id, sticker_command)
-            
-            # Увеличиваем счетчик бесплатных напитков Кати
-            increment_katya_drinks(chat_id)
-            
-            # Сохраняем ответ бота с информацией о стикере
-            save_message(chat_id, user_tg_id, "assistant", answer, sent_message.message_id, None, sticker_command)
+        
+        # 6) Проверяем, можем ли отправить стикер (если LLM его определил)
+        if sticker_command:
+            # Проверяем, может ли Катя пить бесплатно
+            if can_katya_drink_free(chat_id):
+                # Отправляем стикер и увеличиваем счетчик
+                await send_sticker_by_command(sticker_command, chat_id)
+                increment_katya_drinks(chat_id)
+                
+                # Сохраняем ответ бота С информацией о стикере
+                save_message(chat_id, user_tg_id, "assistant", answer, sent_message.message_id, None, sticker_command)
+            else:
+                # Катя исчерпала лимит бесплатных напитков - НЕ отправляем стикер
+                await send_gift_request(chat_id, user_tg_id)
+                
+                # Сохраняем ответ бота БЕЗ стикера
+                save_message(chat_id, user_tg_id, "assistant", answer, sent_message.message_id)
         else:
-            # Катя исчерпала лимит бесплатных напитков - НЕ отправляем стикер
-            await send_gift_request(chat_id, user_tg_id)
-            
-            # Сохраняем ответ бота БЕЗ стикера
+            # Сохраняем ответ бота без стикера
             save_message(chat_id, user_tg_id, "assistant", answer, sent_message.message_id)
-    else:
-        # Сохраняем ответ бота без стикера
-        save_message(chat_id, user_tg_id, "assistant", answer, sent_message.message_id)
+    except Exception as e:
+        logger.exception(f"Message handler error: {e}")
+        try:
+            await update.message.reply_text("Произошла ошибка. Попробуй еще раз! 🤔")
+        except Exception:
+            pass  # Не падаем из-за ошибки в ответе
 
 def get_alcohol_sticker_count(user_tg_id: int) -> int:
     """Получение количества стикеров алкоголя для пользователя"""
@@ -1146,14 +1177,46 @@ async def root():
     return "OK"
 
 @app.post(f"/webhook/{{token}}")
+@safe_execute_sync
 async def telegram_webhook(token: str, request: Request):
+    """Webhook с защитой от ошибок"""
     if token != BOT_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    data = await request.json()
-    update = Update.de_json(data, tapp.bot)  # type: ignore
-    await tapp.process_update(update)        # type: ignore
-    return PlainTextResponse("OK")
+    try:
+        data = await request.json()
+        
+        # Валидация данных webhook
+        if not isinstance(data, dict):
+            logger.warning("Invalid webhook data format")
+            return PlainTextResponse("Invalid data", status_code=400)
+        
+        if tapp is None:
+            logger.error("Telegram application not initialized")
+            return PlainTextResponse("Service unavailable", status_code=503)
+        
+        update = Update.de_json(data, tapp.bot)
+        await tapp.process_update(update)
+        return PlainTextResponse("OK")
+        
+    except Exception as e:
+        logger.exception(f"Webhook error: {e}")
+        return PlainTextResponse("Internal error", status_code=500)
+
+# Добавляем endpoint для мониторинга
+@app.get("/health")
+async def health_check():
+    """Endpoint для проверки здоровья приложения"""
+    return get_health_status()
+
+@app.get("/metrics")
+async def get_metrics():
+    """Endpoint для метрик (можно использовать с Prometheus)"""
+    return {
+        "error_counts": dict(error_counts),
+        "rate_limits": {str(k): v for k, v in user_message_counts.items()},
+        "uptime": time.time() - start_time
+    }
 
 # -----------------------------
 # События запуска/остановки
@@ -1189,3 +1252,154 @@ async def on_shutdown():
             await tapp.stop()
         except Exception:
             logger.exception("Error on telegram app stop")
+
+# -----------------------------
+# Система безопасности и мониторинга
+# -----------------------------
+import traceback
+from functools import wraps
+import time
+from collections import defaultdict
+
+# Счетчики ошибок для мониторинга
+error_counts = defaultdict(int)
+last_error_time = defaultdict(float)
+
+def safe_execute(func):
+    """Декоратор для безопасного выполнения функций"""
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            error_counts[func.__name__] += 1
+            last_error_time[func.__name__] = time.time()
+            logger.exception(f"Critical error in {func.__name__}: {e}")
+            
+            # Отправляем уведомление о критической ошибке
+            await notify_critical_error(func.__name__, str(e))
+            
+            # Возвращаем безопасный fallback
+            return get_fallback_response(func.__name__)
+    return wrapper
+
+def safe_execute_sync(func):
+    """Декоратор для безопасного выполнения синхронных функций"""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            error_counts[func.__name__] += 1
+            last_error_time[func.__name__] = time.time()
+            logger.exception(f"Critical error in {func.__name__}: {e}")
+            return get_fallback_response(func.__name__)
+    return wrapper
+
+async def notify_critical_error(function_name: str, error: str) -> None:
+    """Уведомление о критической ошибке (можно отправить в мониторинг)"""
+    try:
+        logger.critical(f"CRITICAL ERROR in {function_name}: {error}")
+        # Здесь можно добавить отправку в Slack, Telegram, Sentry и т.д.
+    except Exception:
+        pass  # Не падаем из-за ошибки в уведомлении
+
+def get_fallback_response(function_name: str) -> str:
+    """Безопасный fallback ответ"""
+    fallbacks = {
+        "llm_reply": "Извини, у меня сейчас технические проблемы. Попробуй позже! 😅",
+        "msg_handler": None,  # Не отправляем ответ при ошибке в обработчике
+        "send_auto_messages": None,  # Пропускаем автоматические сообщения
+        "ping_scheduler": None,  # Пропускаем ping
+    }
+    return fallbacks.get(function_name, "Что-то пошло не так. Попробуй еще раз! 🤔")
+
+def validate_user_input(text: str) -> bool:
+    """Валидация пользовательского ввода"""
+    if not text or not isinstance(text, str):
+        return False
+    
+    # Проверяем длину сообщения
+    if len(text) > 4000:  # Telegram лимит
+        return False
+    
+    # Проверяем на подозрительные паттерны
+    suspicious_patterns = [
+        r'<script.*?>',
+        r'javascript:',
+        r'data:',
+        r'vbscript:',
+        r'onload=',
+        r'onerror=',
+    ]
+    
+    text_lower = text.lower()
+    for pattern in suspicious_patterns:
+        if re.search(pattern, text_lower):
+            logger.warning(f"Suspicious input detected: {pattern}")
+            return False
+    
+    return True
+
+def validate_user_id(user_id: int) -> bool:
+    """Валидация ID пользователя"""
+    if not isinstance(user_id, int):
+        return False
+    
+    # Telegram ID должен быть положительным числом
+    if user_id <= 0:
+        return False
+    
+    # Проверяем разумные пределы
+    if user_id > 999999999999:  # Максимальный Telegram ID
+        return False
+    
+    return True
+
+def validate_chat_id(chat_id: int) -> bool:
+    """Валидация ID чата"""
+    if not isinstance(chat_id, int):
+        return False
+    
+    # Чат ID может быть отрицательным (группы)
+    if abs(chat_id) > 999999999999:
+        return False
+    
+    return True
+
+# Rate limiting
+user_message_counts = defaultdict(int)
+user_last_message = defaultdict(float)
+RATE_LIMIT_MESSAGES = 10  # Максимум сообщений в минуту
+RATE_LIMIT_WINDOW = 60  # Окно в секундах
+
+def check_rate_limit(user_id: int) -> bool:
+    """Проверка rate limit для пользователя"""
+    current_time = time.time()
+    
+    # Сбрасываем счетчик если прошла минута
+    if current_time - user_last_message[user_id] > RATE_LIMIT_WINDOW:
+        user_message_counts[user_id] = 0
+        user_last_message[user_id] = current_time
+    
+    # Проверяем лимит
+    if user_message_counts[user_id] >= RATE_LIMIT_MESSAGES:
+        logger.warning(f"Rate limit exceeded for user {user_id}")
+        return False
+    
+    user_message_counts[user_id] += 1
+    return True
+
+def get_health_status() -> dict:
+    """Получение статуса здоровья приложения"""
+    return {
+        "status": "healthy",
+        "errors": dict(error_counts),
+        "database": "connected" if engine else "disconnected",
+        "telegram": "connected" if tapp else "disconnected",
+        "openai": "connected" if client else "disconnected",
+        "uptime": time.time() - start_time if 'start_time' in globals() else 0
+    }
+
+# Глобальная переменная для отслеживания времени запуска
+start_time = time.time()
