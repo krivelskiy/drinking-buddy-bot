@@ -1201,32 +1201,49 @@ def get_last_preference_ask(user_tg_id: int) -> Optional[str]:
         return row[0] if row and row[0] else None
 
 def update_last_preference_ask(user_tg_id: int) -> None:
-    """Обновить дату последнего вопроса о предпочтениях"""
+    """Обновление даты последнего вопроса о предпочтениях"""
     with engine.begin() as conn:
         conn.execute(
             text(f"""
                 UPDATE {USERS_TABLE}
-                SET last_preference_ask = CURRENT_DATE
+                SET {U['last_preference_ask']} = CURRENT_DATE
                 WHERE {U['user_tg_id']} = :tg_id
             """),
             {"tg_id": user_tg_id},
         )
+        logger.info(f"Updated last preference ask date for user {user_tg_id}")
 
-def should_ask_preferences(user_tg_id: int) -> bool:
-    """Проверить, нужно ли спрашивать о предпочтениях (максимум раз в сутки)"""
-    with engine.begin() as conn:
-        result = conn.execute(
-            text(f"""
-                SELECT CASE 
-                    WHEN last_preference_ask IS NULL OR last_preference_ask < CURRENT_DATE THEN true 
-                    ELSE false 
-                END
-                FROM {USERS_TABLE} 
-                WHERE {U['user_tg_id']} = :tg_id
-            """),
-            {"tg_id": user_tg_id}
-        ).fetchone()
-        return result[0] if result else True
+def detect_game_context(recent_messages: list) -> Optional[str]:
+    """Определение активной игры из последних сообщений"""
+    if not recent_messages:
+        return None
+    
+    # Ищем ключевые слова игр в последних сообщениях
+    game_keywords = {
+        "20 вопросов": ["20 вопросов", "двадцать вопросов", "угадай", "загадай"],
+        "правда или действие": ["правда или действие", "правда или ложь"],
+        "крокодил": ["крокодил", "покажи", "изобрази"],
+    }
+    
+    for message in recent_messages[-5:]:  # Проверяем последние 5 сообщений
+        content = message.get("content", "").lower()
+        for game_name, keywords in game_keywords.items():
+            for keyword in keywords:
+                if keyword in content:
+                    logger.info(f"Detected game context: {game_name}")
+                    return game_name
+    
+    return None
+
+def get_game_context_prompt(game_name: str) -> str:
+    """Получение системного промпта для активной игры"""
+    game_prompts = {
+        "20 вопросов": "Сейчас играем в '20 вопросов'! Загадай что-то, а я буду угадывать, задавая вопросы. Отвечай только 'да' или 'нет'.",
+        "правда или действие": "Играем в 'Правда или действие'! Выбирай: правда или действие?",
+        "крокодил": "Играем в 'Крокодил'! Загадай слово, а я буду показывать его жестами.",
+    }
+    
+    return game_prompts.get(game_name, f"Играем в '{game_name}'!")
 
 def parse_drink_preferences(text: str) -> Optional[str]:
     """Парсить предпочтения напитков из текста"""
