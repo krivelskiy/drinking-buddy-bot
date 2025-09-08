@@ -143,7 +143,7 @@ def build_application() -> Application:
 
     # Добавляем обработчики
     app_.add_handler(CommandHandler("gift", gift_command))
-    app_.add_handler(CallbackQueryHandler(gift_callback, pattern="^gift_"))
+    app_.add_handler(CallbackQueryHandler(gift_callback, pattern="^(gift_|gift_menu)"))
     app_.add_handler(PreCheckoutQueryHandler(pre_checkout_query))
     app_.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
     app_.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_handler))
@@ -438,6 +438,14 @@ async def send_sticker_by_command(chat_id: int, sticker_command: str) -> None:
             )
             response.raise_for_status()
             logger.info(f"Sent sticker {sticker_command} to chat {chat_id}")
+            
+            # Проверяем, нужно ли просить подарок после алкогольного стикера
+            if sticker_command.startswith("[SEND_DRINK_"):
+                # Получаем user_tg_id из последнего сообщения
+                user_tg_id = get_last_user_tg_id(chat_id)
+                if user_tg_id and should_ask_for_gift(user_tg_id):
+                    await send_gift_request(chat_id, user_tg_id)
+                    
         except Exception as e:
             logger.exception(f"Failed to send sticker {sticker_command}: {e}")
 
@@ -488,6 +496,11 @@ async def gift_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     
     logger.info(f"Gift callback from user {user_tg_id}: {data}")
     
+    # Если это кнопка открытия меню подарков
+    if data == "gift_menu":
+        await show_gift_menu(query)
+        return
+    
     # Определяем напиток и стоимость (все по 1 звезде)
     drink_info = {
         "gift_wine": {"name": "🍷 Вино", "stars": 1, "sticker": "[SEND_DRINK_WINE]"},
@@ -519,6 +532,30 @@ async def gift_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         reply_markup=reply_markup
     )
 
+async def show_gift_menu(query) -> None:
+    """Показывает меню подарков"""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("🍷 Вино (1 ⭐)", callback_data="gift_wine"),
+            InlineKeyboardButton("🍸 Водка (1 ⭐)", callback_data="gift_vodka")
+        ],
+        [
+            InlineKeyboardButton("🥃 Виски (1 ⭐)", callback_data="gift_whisky"),
+            InlineKeyboardButton("🍺 Пиво (1 ⭐)", callback_data="gift_beer")
+        ]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        "🎁 Выбери напиток для Кати:\n\n"
+        "Катя будет очень рада получить от тебя подарок! 💕\n"
+        "Все напитки стоят всего 1 звезду! ⭐",
+        reply_markup=reply_markup
+    )
+
 async def pre_checkout_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик предварительной проверки платежа"""
     query = update.pre_checkout_query
@@ -543,10 +580,10 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     # Определяем какой напиток был куплен
     drink_info = {
-        "wine": {"name": "🍷 Вино", "sticker": "[SEND_DRINK_WINE]"},
-        "vodka": {"name": "🍸 Водка", "sticker": "[SEND_DRINK_VODKA]"},
-        "whisky": {"name": "🥃 Виски", "sticker": "[SEND_DRINK_WHISKY]"},
-        "beer": {"name": "🍺 Пиво", "sticker": "[SEND_DRINK_BEER]"}
+        "wine": {"name": "🍷 Вино", "sticker": "[SEND_DRINK_WINE]", "emoji": "🍷"},
+        "vodka": {"name": "🍸 Водка", "sticker": "[SEND_DRINK_VODKA]", "emoji": "🍸"},
+        "whisky": {"name": "🥃 Виски", "sticker": "[SEND_DRINK_WHISKY]", "emoji": "🥃"},
+        "beer": {"name": "🍺 Пиво", "sticker": "[SEND_DRINK_BEER]", "emoji": "🍺"}
     }
     
     drink_type = payment.invoice_payload
@@ -555,18 +592,29 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     drink = drink_info[drink_type]
     
-    # Отправляем благодарность
-    await update.message.reply_text(
-        f"🎉 Спасибо за подарок!\n\n"
-        f"Катя получила {drink['name']} и очень рада! 💕\n"
-        f"Она обязательно отблагодарит тебя! 😊"
-    )
+    # Отправляем искреннюю благодарность
+    gratitude_messages = [
+        f"🎉 Ого! Ты подарил мне {drink['name']}!",
+        f"💕 Я так рада! Спасибо тебе огромное!",
+        f" Ты самый лучший! Сейчас выпью твой подарок!",
+        f"{drink['emoji']} *выпивает* Ммм, как вкусно!",
+        f"💖 Ты сделал мой день! Обнимаю тебя! 🤗"
+    ]
     
-    # Отправляем стикер
+    for i, message in enumerate(gratitude_messages):
+        try:
+            await update.message.reply_text(message)
+            if i == 0:  # После первого сообщения отправляем стикер
+                await send_sticker_by_command(chat_id, drink['sticker'])
+        except Exception as e:
+            logger.exception(f"Failed to send gratitude message {i}: {e}")
+    
+    # Сохраняем сообщения благодарности
     try:
-        await send_sticker_by_command(chat_id, drink['sticker'])
+        for message in gratitude_messages:
+            save_message(chat_id, user_tg_id, "assistant", message)
     except Exception as e:
-        logger.exception(f"Failed to send gift sticker: {e}")
+        logger.exception(f"Failed to save gratitude messages: {e}")
 
 # -----------------------------
 # Хендлер сообщений
@@ -623,6 +671,73 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await send_sticker_by_command(chat_id, sticker_command)
         except Exception:
             logger.exception("Failed to send sticker")
+
+def get_alcohol_sticker_count(user_tg_id: int) -> int:
+    """Получение количества стикеров алкоголя для пользователя"""
+    with engine.begin() as conn:
+        # Подсчитываем сообщения с алкогольными стикерами за последние 24 часа
+        result = conn.execute(
+            text(f"""
+                SELECT COUNT(*) FROM {MESSAGES_TABLE} 
+                WHERE {M['user_tg_id']} = :user_tg_id 
+                AND {M['role']} = 'assistant'
+                AND {M['content']} LIKE '%[SEND_DRINK_%'
+                AND {M['created_at']} > NOW() - INTERVAL '24 hours'
+            """),
+            {"user_tg_id": user_tg_id}
+        ).fetchone()
+        return result[0] if result else 0
+
+def should_ask_for_gift(user_tg_id: int) -> bool:
+    """Проверяет, нужно ли просить подарок (каждые 3 стикера алкоголя)"""
+    count = get_alcohol_sticker_count(user_tg_id)
+    return count > 0 and count % 3 == 0
+
+async def send_gift_request(chat_id: int, user_tg_id: int) -> None:
+    """Отправляет сообщение с просьбой о подарке и кнопкой"""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    
+    keyboard = [
+        [InlineKeyboardButton("🎁 Купить подарок Кате", callback_data="gift_menu")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    messages = [
+        "😔 У меня заканчиваются мои напитки...",
+        "🍷 Может быть, ты угостишь меня чем-нибудь вкусненьким?",
+        "💕 Я буду очень благодарна за любой подарок!",
+        " Нажми кнопку ниже, чтобы выбрать напиток для меня:"
+    ]
+    
+    # Отправляем сообщение с кнопкой
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json={
+                    "chat_id": chat_id,
+                    "text": "\n".join(messages),
+                    "reply_markup": reply_markup
+                }
+            )
+            response.raise_for_status()
+            logger.info(f"Sent gift request to chat {chat_id}")
+        except Exception as e:
+            logger.exception(f"Failed to send gift request: {e}")
+
+def get_last_user_tg_id(chat_id: int) -> Optional[int]:
+    """Получение user_tg_id последнего пользователя в чате"""
+    with engine.begin() as conn:
+        result = conn.execute(
+            text(f"""
+                SELECT {M['user_tg_id']} FROM {MESSAGES_TABLE} 
+                WHERE {M['chat_id']} = :chat_id 
+                ORDER BY {M['created_at']} DESC 
+                LIMIT 1
+            """),
+            {"chat_id": chat_id}
+        ).fetchone()
+        return result[0] if result else None
 
 # -----------------------------
 # FastAPI приложение
