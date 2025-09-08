@@ -68,7 +68,8 @@ def init_db():
                 content TEXT NOT NULL,
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 reply_to_message_id INTEGER,
-                message_id INTEGER
+                message_id INTEGER,
+                sticker_sent TEXT
             )
         """))
         
@@ -108,6 +109,12 @@ def init_db():
             conn.execute(DDL(f"""
                 ALTER TABLE {MESSAGES_TABLE} 
                 ADD COLUMN IF NOT EXISTS reply_to_message_id INTEGER
+            """))
+            
+            # Добавляем колонку sticker_sent к messages если её нет
+            conn.execute(DDL(f"""
+                ALTER TABLE {MESSAGES_TABLE} 
+                ADD COLUMN IF NOT EXISTS sticker_sent TEXT
             """))
             
         except Exception as e:
@@ -206,13 +213,13 @@ def upsert_user_from_update(update: Update) -> None:
                 },
             )
 
-def save_message(chat_id: int, user_tg_id: int, role: str, content: str, message_id: Optional[int] = None, reply_to_message_id: Optional[int] = None) -> None:
+def save_message(chat_id: int, user_tg_id: int, role: str, content: str, message_id: Optional[int] = None, reply_to_message_id: Optional[int] = None, sticker_sent: Optional[str] = None) -> None:
     """Сохранение сообщения в БД"""
     with engine.begin() as conn:
         conn.execute(
             text(f"""
-                INSERT INTO {MESSAGES_TABLE} ({M['chat_id']}, {M['user_tg_id']}, {M['role']}, {M['content']}, {M['message_id']}, {M['reply_to_message_id']})
-                VALUES (:chat_id, :user_tg_id, :role, :content, :message_id, :reply_to_message_id)
+                INSERT INTO {MESSAGES_TABLE} ({M['chat_id']}, {M['user_tg_id']}, {M['role']}, {M['content']}, {M['message_id']}, {M['reply_to_message_id']}, sticker_sent)
+                VALUES (:chat_id, :user_tg_id, :role, :content, :message_id, :reply_to_message_id, :sticker_sent)
             """),
             {
                 "chat_id": chat_id,
@@ -221,6 +228,7 @@ def save_message(chat_id: int, user_tg_id: int, role: str, content: str, message
                 "content": content,
                 "message_id": message_id,
                 "reply_to_message_id": reply_to_message_id,
+                "sticker_sent": sticker_sent,
             },
         )
 
@@ -441,10 +449,22 @@ async def send_sticker_by_command(chat_id: int, sticker_command: str) -> None:
             
             # Проверяем, нужно ли просить подарок после алкогольного стикера
             if sticker_command.startswith("[SEND_DRINK_"):
+                logger.info(f"Alcohol sticker sent, checking gift request for chat {chat_id}")
                 # Получаем user_tg_id из последнего сообщения
                 user_tg_id = get_last_user_tg_id(chat_id)
-                if user_tg_id and should_ask_for_gift(user_tg_id):
-                    await send_gift_request(chat_id, user_tg_id)
+                logger.info(f"Last user_tg_id for chat {chat_id}: {user_tg_id}")
+                
+                if user_tg_id:
+                    alcohol_count = get_alcohol_sticker_count(user_tg_id)
+                    logger.info(f"Alcohol sticker count for user {user_tg_id}: {alcohol_count}")
+                    
+                    if should_ask_for_gift(user_tg_id):
+                        logger.info(f"Should ask for gift! Sending request to chat {chat_id}")
+                        await send_gift_request(chat_id, user_tg_id)
+                    else:
+                        logger.info(f"Not time to ask for gift yet for user {user_tg_id}")
+                else:
+                    logger.warning(f"No user_tg_id found for chat {chat_id}")
                     
         except Exception as e:
             logger.exception(f"Failed to send sticker {sticker_command}: {e}")
@@ -641,6 +661,8 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # 2) Сохраняем сообщение пользователя
     try:
+        answer, sticker_command = await llm_reply(text_in, username, user_tg_id, chat_id)
+        sent_message = await update.message.reply_text(answer)
         save_message(chat_id, user_tg_id, "user", text_in, message_id)
     except Exception:
         logger.exception("Failed to save user message")
@@ -655,7 +677,7 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             logger.exception("Failed to update user age")
 
     # 4) Генерируем ответ через OpenAI
-    answer, sticker_command = await llm_reply(text_in, username, user_tg_id, chat_id)
+    # answer, sticker_command = await llm_reply(text_in, username, user_tg_id, chat_id) # This line is now redundant
 
     # 5) Отправляем ответ
     try:
@@ -669,8 +691,15 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if sticker_command:
         try:
             await send_sticker_by_command(chat_id, sticker_command)
+            # Сохраняем ответ бота с информацией о стикере
+            save_message(chat_id, user_tg_id, "assistant", answer, sent_message.message_id, None, sticker_command)
         except Exception:
             logger.exception("Failed to send sticker")
+            # Сохраняем ответ бота без стикера
+            save_message(chat_id, user_tg_id, "assistant", answer, sent_message.message_id)
+    else:
+        # Сохраняем ответ бота без стикера
+        save_message(chat_id, user_tg_id, "assistant", answer, sent_message.message_id)
 
 def get_alcohol_sticker_count(user_tg_id: int) -> int:
     """Получение количества стикеров алкоголя для пользователя"""
@@ -681,7 +710,7 @@ def get_alcohol_sticker_count(user_tg_id: int) -> int:
                 SELECT COUNT(*) FROM {MESSAGES_TABLE} 
                 WHERE {M['user_tg_id']} = :user_tg_id 
                 AND {M['role']} = 'assistant'
-                AND {M['content']} LIKE '%[SEND_DRINK_%'
+                AND sticker_sent LIKE '[SEND_DRINK_%'
                 AND {M['created_at']} > NOW() - INTERVAL '24 hours'
             """),
             {"user_tg_id": user_tg_id}
@@ -691,6 +720,7 @@ def get_alcohol_sticker_count(user_tg_id: int) -> int:
 def should_ask_for_gift(user_tg_id: int) -> bool:
     """Проверяет, нужно ли просить подарок (каждые 3 стикера алкоголя)"""
     count = get_alcohol_sticker_count(user_tg_id)
+    logger.info(f"Checking gift request for user {user_tg_id}: count={count}, should_ask={count > 0 and count % 3 == 0}")
     return count > 0 and count % 3 == 0
 
 async def send_gift_request(chat_id: int, user_tg_id: int) -> None:
