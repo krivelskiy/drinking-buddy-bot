@@ -173,7 +173,7 @@ def upsert_user_from_update(update: Update) -> None:
             conn.execute(
                 text(f"""
                     UPDATE {USERS_TABLE}
-                    SET {U['username']} = :username, {U['first_name']} = :first_name, {U['last_name']} = :last_name, {U['chat_id']} = :chat_id
+                    SET {U['username']} = :username, {U['first_name']} = :first_name, {U['last_name']} = :last_name, {U['chat_id']} = :chat_id, tg_id = :tg_id
                     WHERE {U['user_tg_id']} = :tg_id
                 """),
                 {
@@ -188,8 +188,8 @@ def upsert_user_from_update(update: Update) -> None:
             # Создаем нового пользователя
             conn.execute(
                 text(f"""
-                    INSERT INTO {USERS_TABLE} ({U['user_tg_id']}, {U['chat_id']}, {U['username']}, {U['first_name']}, {U['last_name']})
-                    VALUES (:tg_id, :chat_id, :username, :first_name, :last_name)
+                    INSERT INTO {USERS_TABLE} ({U['user_tg_id']}, {U['chat_id']}, {U['username']}, {U['first_name']}, {U['last_name']}, tg_id)
+                    VALUES (:tg_id, :chat_id, :username, :first_name, :last_name, :tg_id)
                 """),
                 {
                     "tg_id": tg_id,
