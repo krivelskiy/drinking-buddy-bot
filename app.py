@@ -1169,7 +1169,23 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             logger.exception("Failed to update drink count")
 
     # 5) Генерируем ответ через OpenAI
-    answer, sticker_command = await llm_reply(text_in, None, user_tg_id, chat_id)
+    recent_messages = get_recent_messages(chat_id, limit=12)
+    answer = llm_reply(text_in, user_tg_id, chat_id, recent_messages)
+    
+    # Определяем команду стикера на основе ответа
+    sticker_command = None
+    if any(keyword in answer.lower() for keyword in ["выпьем", "выпьемте", "пьем", "пьемте", "выпьем вместе", "давай выпьем"]):
+        sticker_command = "[SEND_DRINK_BEER]"
+    elif any(keyword in answer.lower() for keyword in ["водка", "водочка", "водочки"]):
+        sticker_command = "[SEND_DRINK_VODKA]"
+    elif any(keyword in answer.lower() for keyword in ["вино", "винцо", "винца"]):
+        sticker_command = "[SEND_DRINK_WINE]"
+    elif any(keyword in answer.lower() for keyword in ["виски", "вискарь", "вискаря"]):
+        sticker_command = "[SEND_DRINK_WHISKEY]"
+    elif any(keyword in answer.lower() for keyword in ["грустно", "печально", "тоскливо", "грустная"]):
+        sticker_command = "[SEND_SAD_STICKER]"
+    elif any(keyword in answer.lower() for keyword in ["радостно", "весело", "счастливо", "радостная"]):
+        sticker_command = "[SEND_HAPPY_STICKER]"
 
     # 6) Отправляем ответ
     try:
