@@ -530,29 +530,32 @@ async def gift_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     
     drink = drink_info[data]
     
-    # Создаем инлайн клавиатуру для оплаты
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    # Создаем ПЛАТЕЖНОЕ сообщение через send_invoice
+    from telegram import LabeledPrice
     
-    keyboard = [
-        [InlineKeyboardButton(f"💳 Оплатить {drink['stars']} ⭐", pay=True)]
-    ]
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    # Отправляем НОВОЕ сообщение с кнопками оплаты вместо редактирования
-    await query.message.reply_text(
-        f"🎁 Подарок для Кати: {drink['name']}\n\n"
-        f"Стоимость: {drink['stars']} ⭐\n\n"
-        f"Катя будет в восторге! 💕\n"
-        f"Нажми кнопку ниже для оплаты:",
-        reply_markup=reply_markup
-    )
-    
-    # Удаляем старое сообщение с меню
     try:
-        await query.message.delete()
+        await query.message.reply_invoice(
+            title=f"🎁 Подарок для Кати: {drink['name']}",
+            description=f"Катя будет в восторге от этого подарка! 💕",
+            payload=f"gift_{data}",  # Уникальный payload для идентификации
+            provider_token="",  # Для Telegram Stars не нужен
+            currency="XTR",  # Telegram Stars
+            prices=[LabeledPrice(f"{drink['name']}", drink['stars'])],
+            start_parameter=f"gift_{data}",
+            photo_url="https://via.placeholder.com/300x200/FF6B6B/FFFFFF?text=🎁+Gift+for+Katya",
+            photo_width=300,
+            photo_height=200
+        )
+        
+        # Удаляем старое сообщение с меню
+        try:
+            await query.message.delete()
+        except Exception as e:
+            logger.exception(f"Failed to delete old message: {e}")
+            
     except Exception as e:
-        logger.exception(f"Failed to delete old message: {e}")
+        logger.exception(f"Failed to send invoice: {e}")
+        await query.edit_message_text("❌ Ошибка при создании платежа")
 
 async def show_gift_menu(query) -> None:
     """Показывает меню подарков"""
