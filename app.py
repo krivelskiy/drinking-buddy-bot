@@ -780,7 +780,7 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         try:
             update_user_age(user_tg_id, age)
             logger.info("Updated user age to %d", age)
-    except Exception:
+        except Exception:
             logger.exception("Failed to update user age")
 
     # 3.5) Проверяем на упоминание предпочтений напитков
@@ -798,7 +798,7 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # 5) Отправляем ответ
     try:
         sent_message = await update.message.reply_text(answer)
-            except Exception:
+    except Exception:
         logger.exception("Failed to send reply")
         return
 
