@@ -500,7 +500,7 @@ def update_user_age(user_tg_id: int, age: int) -> None:
         )
         logger.info(f"Updated age for user {user_tg_id} to {age}")
 
-def get_recent_messages(chat_id: int, limit: int = 10) -> list:
+def get_recent_messages(chat_id: int, limit: int = 12) -> list:
     """Получение последних сообщений для контекста"""
     with engine.begin() as conn:
         rows = conn.execute(
@@ -515,110 +515,44 @@ def get_recent_messages(chat_id: int, limit: int = 10) -> list:
         ).fetchall()
         return [{"role": row[0], "content": row[1]} for row in rows]
 
-def parse_age_from_text(text: str) -> Optional[int]:
-    """Простой парсер возраста из текста"""
-    # Ищем паттерны типа "мне 25 лет", "25 лет", "я 25-летний" и т.п.
-    patterns = [
-        r'мне\s+(\d+)\s+лет',
-        r'(\d+)\s+лет',
-        r'я\s+(\d+)[-]?летний',
-        r'(\d+)[-]?летний',
-        r'возраст\s+(\d+)',
-    ]
+def get_user_facts(user_tg_id: int) -> str:
+    """Получить важные факты о пользователе для контекста"""
+    facts = []
     
-    for pattern in patterns:
-        match = re.search(pattern, text.lower())
-        if match:
-            try:
-                age = int(match.group(1))
-                if 1 <= age <= 150:  # разумные границы возраста
-                    logger.info(f"Parsed age from text '{text}': {age}")
-                    return age
-            except ValueError:
-                continue
+    # Возраст
+    age = get_user_age(user_tg_id)
+    if age:
+        facts.append(f"Возраст: {age} лет")
     
-    return None
+    # Предпочтения
+    preferences = get_user_preferences(user_tg_id)
+    if preferences:
+        facts.append(f"Любимый напиток: {preferences}")
+    
+    # Имя
+    name = get_user_name(user_tg_id)
+    if name:
+        facts.append(f"Имя: {name}")
+    
+    return ", ".join(facts) if facts else ""
 
-async def send_beer_sticker(chat_id: int) -> None:
-    """Отправка стикера пива через Telegram API"""
-    if not BOT_TOKEN or not BEER_STICKERS:
-        return
+def build_conversation_context(recent_messages: list, user_text: str) -> list:
+    """Построить контекст разговора с умным сжатием"""
+    # Берем последние 8 сообщений (4 пары вопрос-ответ)
+    context_messages = recent_messages[-8:] if len(recent_messages) > 8 else recent_messages
     
-    sticker_id = BEER_STICKERS[0]  # берем первый стикер из списка
+    # Разворачиваем в хронологическом порядке
+    context_messages.reverse()
     
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendSticker",
-                json={
-                    "chat_id": chat_id,
-                    "sticker": sticker_id
-                }
-            )
-            if response.status_code == 200:
-                logger.info("✅ Beer sticker sent successfully")
-            else:
-                logger.warning("Failed to send sticker: %s", response.text)
-        except Exception as e:
-            logger.exception("Error sending sticker: %s", e)
-
-# -----------------------------
-# Генерация ответа
-# -----------------------------
-def load_context() -> str:
-    """Загрузка контекста из Context.txt"""
-    try:
-        with open("Context.txt", "r", encoding="utf-8") as f:
-            content = f.read().strip()
-            logger.info(f"Loaded context: {content[:100]}...")
-            return content
-    except Exception as e:
-        logger.exception("Failed to load context from Context.txt")
-        return "Ты — Катя Собутыльница: живая девушка, дружелюбная, немного флиртуешь, любишь пошутить и выпить. Ты любишь алкогольные напитки и всегда готова поддержать компанию за рюмочку. Отвечай коротко и по делу, как живой человек. Если пользователь предлагает выпить или упоминает алкоголь - ты всегда соглашаешься и радуешься."
-
-SYSTEM_PROMPT = load_context()
-
-def get_user_name(user_tg_id: int) -> Optional[str]:
-    """Получение имени пользователя из БД"""
-    with engine.begin() as conn:
-        row = conn.execute(
-            text(f"SELECT {U['first_name']} FROM {USERS_TABLE} WHERE {U['user_tg_id']} = :tg_id"),
-            {"tg_id": user_tg_id},
-        ).fetchone()
-        return row[0] if row and row[0] else None
-
-def detect_game_context(recent_messages: list) -> Optional[str]:
-    """Определить активную игру по последним сообщениям"""
-    if not recent_messages:
-        return None
+    # Фильтруем только релевантные сообщения
+    filtered_messages = []
+    for msg in context_messages:
+        # Пропускаем очень короткие сообщения
+        if len(msg["content"].strip()) < 3:
+            continue
+        filtered_messages.append(msg)
     
-    # Ищем упоминания игр в последних сообщениях
-    game_keywords = {
-        "20 вопросов": ["20 вопросов", "двадцать вопросов", "играем в 20", "загадала слово", "загадал слово"],
-        "правда или действие": ["правда или действие", "правда или ложь", "действие"],
-        "угадай число": ["угадай число", "загадал число", "число от 1 до"],
-        "виселица": ["виселица", "hangman", "угадай слово"]
-    }
-    
-    # Проверяем последние 5 сообщений
-    for msg in recent_messages[-5:]:
-        if msg["role"] == "user":
-            text_lower = msg["content"].lower()
-            for game_name, keywords in game_keywords.items():
-                if any(keyword in text_lower for keyword in keywords):
-                    return game_name
-    
-    return None
-
-def get_game_context_prompt(game_name: str) -> str:
-    """Получить промпт для конкретной игры"""
-    game_prompts = {
-        "20 вопросов": "СЕЙЧАС ИДЕТ ИГРА '20 ВОПРОСОВ'! Ты загадала слово, и пользователь задает вопросы чтобы угадать. Отвечай ТОЛЬКО 'да' или 'нет' на вопросы о свойствах загаданного слова. НЕ отвлекайся на другие темы!",
-        "правда или действие": "СЕЙЧАС ИДЕТ ИГРА 'ПРАВДА ИЛИ ДЕЙСТВИЕ'! Предлагай вопросы или действия для пользователя.",
-        "угадай число": "СЕЙЧАС ИДЕТ ИГРА 'УГАДАЙ ЧИСЛО'! Ты загадала число, пользователь пытается угадать.",
-        "виселица": "СЕЙЧАС ИДЕТ ИГРА 'ВИСЕЛИЦА'! Ты загадала слово, пользователь угадывает буквы."
-    }
-    return game_prompts.get(game_name, "")
+    return filtered_messages
 
 async def llm_reply(user_text: str, username: Optional[str], user_tg_id: int, chat_id: int) -> tuple[str, Optional[str]]:
     """
@@ -631,8 +565,8 @@ async def llm_reply(user_text: str, username: Optional[str], user_tg_id: int, ch
         # Получаем возраст пользователя
         user_age = get_user_age(user_tg_id)
         
-        # Получаем историю сообщений
-        recent_messages = get_recent_messages(chat_id, limit=5)
+        # Получаем историю сообщений (увеличили лимит)
+        recent_messages = get_recent_messages(chat_id, limit=12)
         
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -646,14 +580,11 @@ async def llm_reply(user_text: str, username: Optional[str], user_tg_id: int, ch
         should_ask_prefs = should_ask_preferences(user_tg_id)
         logger.info(f"Should ask preferences for user {user_tg_id}: {should_ask_prefs}")
         
-        # Добавляем информацию о пользователе
-        if user_age:
-            messages.append({"role": "system", "content": f"Пользователю {user_age} лет."})
-        
-        # Получаем имя пользователя из БД для более точного обращения
-        user_name = get_user_name(user_tg_id)
-        if user_name:
-            messages.append({"role": "system", "content": f"Имя пользователя: {user_name}. Обращайся к нему по имени, а не по username."})
+        # Добавляем важные факты о пользователе
+        user_facts = get_user_facts(user_tg_id)
+        if user_facts:
+            messages.append({"role": "system", "content": f"ВАЖНЫЕ ФАКТЫ О ПОЛЬЗОВАТЕЛЕ: {user_facts}. Всегда помни эти факты и используй их в разговоре."})
+            logger.info(f"Added user facts: {user_facts}")
         
         # Добавляем информацию о предпочтениях
         if user_preferences:
@@ -680,14 +611,14 @@ async def llm_reply(user_text: str, username: Optional[str], user_tg_id: int, ch
             logger.info(f"Added holiday context: {holiday_text}")
             update_last_holiday_suggest(user_tg_id)
         
-        # Добавляем историю сообщений (только ответы Кати для контекста)
-        for msg in reversed(recent_messages[-3:]):  # только последние 3 сообщения
-            if msg["role"] == "assistant":  # ТОЛЬКО ответы Кати, НЕ сообщения пользователя
-                messages.append(msg)
+        # Добавляем контекст разговора (теперь включаем сообщения пользователя!)
+        conversation_context = build_conversation_context(recent_messages, user_text)
+        for msg in conversation_context:
+            messages.append(msg)
         
         messages.append({"role": "user", "content": user_text})
         
-        logger.info(f"LLM request for user {user_tg_id}: {len(messages)} messages, age: {user_age}, name: {user_name}")
+        logger.info(f"LLM request for user {user_tg_id}: {len(messages)} messages, context: {len(conversation_context)} messages")
 
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
