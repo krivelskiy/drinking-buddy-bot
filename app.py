@@ -38,7 +38,12 @@ logger = logging.getLogger("app")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 # -----------------------------
-# Инициализация БД
+# Глобальные переменные
+# -----------------------------
+tapp: Optional[Application] = None
+
+# -----------------------------
+# Инициализация
 # -----------------------------
 engine: Engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
 logger.info("✅ Database engine created")
@@ -358,8 +363,6 @@ async def auto_message_scheduler():
 # -----------------------------
 if not BOT_TOKEN:
     logger.error("BOT_TOKEN is empty (webhook/бот работать не будет)")
-
-tapp: Optional[Application] = None
 
 async def ping_scheduler():
     """Ping-бот для предотвращения засыпания приложения на Render"""
@@ -1227,19 +1230,20 @@ async def telegram_webhook(token: str, request: Request):
 @app.on_event("startup")
 async def on_startup():
     """Инициализация при запуске"""
+    global tapp
     logger.info("🚀 Starting application...")
     
     # Инициализация БД
     init_db()
     
     # Инициализация Telegram приложения
-    app = build_application()
-    await app.initialize()
-    await app.start()
+    tapp = build_application()
+    await tapp.initialize()
+    await tapp.start()
     
     # Установка webhook
     webhook_url = f"{RENDER_EXTERNAL_URL}/webhook/{BOT_TOKEN}"
-    await app.bot.set_webhook(webhook_url)
+    await tapp.bot.set_webhook(webhook_url)
     logger.info(f"✅ Webhook set to {webhook_url}")
     
     # Запуск планировщиков
