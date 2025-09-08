@@ -561,6 +561,33 @@ def update_user_age(user_tg_id: int, age: int) -> None:
         )
         logger.info(f"Updated age for user {user_tg_id} to {age}")
 
+def parse_age_from_text(text: str) -> Optional[int]:
+    """Парсинг возраста из текста сообщения"""
+    if not text:
+        return None
+    
+    # Паттерны для поиска возраста
+    patterns = [
+        r'мне\s+(\d+)\s+лет',
+        r'мне\s+(\d+)',
+        r'(\d+)\s+лет',
+        r'возраст\s+(\d+)',
+        r'(\d+)\s+годиков',
+        r'(\d+)\s+год',
+    ]
+    
+    text_lower = text.lower()
+    for pattern in patterns:
+        match = re.search(pattern, text_lower)
+        if match:
+            age = int(match.group(1))
+            # Проверяем разумные пределы возраста
+            if 1 <= age <= 120:
+                logger.info(f"Parsed age from text: {age}")
+                return age
+    
+    return None
+
 def get_recent_messages(chat_id: int, limit: int = 12) -> list:
     """Получение последних сообщений для контекста"""
     with engine.begin() as conn:
