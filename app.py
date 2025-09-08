@@ -2258,3 +2258,148 @@ def generate_new_topic(user_facts: str, day_info: dict) -> str:
     except Exception as e:
         logger.error(f"Error generating new topic: {e}")
         return "А что ты обычно делаешь в такие дни? 😊"
+
+# -----------------------------
+# ИСПРАВЛЕНИЯ: Критические ошибки
+# -----------------------------
+
+# 1. Исправляю вызов llm_reply в msg_handler
+# Заменяю:
+# answer, sticker_command = await llm_reply(text_in, None, user_tg_id, chat_id)
+
+# На:
+# Получаем историю сообщений для контекста
+recent_messages = get_recent_messages(chat_id, limit=20)
+answer = llm_reply(text_in, user_tg_id, chat_id, recent_messages)
+
+# 2. Добавляю недостающую функцию format_context_messages
+def format_context_messages(messages: list) -> str:
+    """Форматирование сообщений для контекста"""
+    if not messages:
+        return "Нет предыдущих сообщений"
+    
+    formatted = []
+    for msg in messages:
+        role = msg.get('role', 'unknown')
+        content = msg.get('content', '')
+        formatted.append(f"{role}: {content}")
+    
+    return "\n".join(formatted)
+
+# 3. Исправляю функцию llm_reply - убираю await и исправляю аргументы
+def llm_reply(user_text: str, user_tg_id: int, chat_id: int, recent_messages: list) -> str:
+    """Генерация ответа через LLM"""
+    try:
+        # Проверяем что recent_messages это список
+        if not isinstance(recent_messages, list):
+            logger.error(f"recent_messages is not a list: {type(recent_messages)}")
+            recent_messages = []
+        
+        # Получаем факты о пользователе
+        user_facts = get_user_facts(user_tg_id)
+        
+        # Получаем предпочтения
+        user_preferences = get_user_preferences(user_tg_id)
+        
+        # Получаем информацию о дне недели
+        day_info = get_current_day_info()
+        
+        # Строим контекст разговора
+        context_messages = build_conversation_context(recent_messages, user_text)
+        
+        # Определяем игровой контекст
+        game_context_prompt = detect_game_context(context_messages)
+        
+        # Проверяем праздники
+        holidays = get_today_holidays()
+        holiday_context = ""
+        if holidays and should_suggest_holiday(user_tg_id):
+            holiday_context = f"\nСегодня праздник: {', '.join(holidays)}. Это отличный повод выпить!"
+        
+        # Строим промпт
+        prompt = f"""{SYSTEM_PROMPT}
+
+Информация о пользователе: {user_facts}
+Предпочтения в напитках: {user_preferences}
+Сегодня: {day_info['day_name'].capitalize()}
+{holiday_context}
+
+Контекст разговора:
+{format_context_messages(context_messages)}
+
+Текущее сообщение пользователя: {user_text}
+
+Правила:
+- Отвечай коротко и по делу, как живой человек
+- НЕ говори "Привет" или другие приветствия в середине диалога - это неуместно!
+- НЕ заканчивай разговор! Всегда задавай дополнительные вопросы или развивай тему
+- Будь активной собеседницей - инициируй новые темы
+- Если пользователь просит придумать поводы для выпивки, используй информацию о дне недели
+- Не предлагай выпить в честь неправильного дня (например, не говори про пятницу в понедельник)
+- Помни о предпочтениях пользователя в напитках
+- Если пользователь предлагает выпить или упоминает алкоголь - всегда соглашайся и радуйся
+{game_context_prompt}
+
+Ответ:"""
+
+        # Вызываем LLM
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=200,
+            temperature=0.8
+        )
+        
+        answer = response.choices[0].message.content.strip()
+        logger.info(f"LLM raw response for user {user_tg_id}: {repr(answer)}")
+        
+        # Проверяем не заканчивает ли Катя разговор
+        ending_phrases = [
+            "если что-то понадобится",
+            "я всегда здесь",
+            "удачи",
+            "всего хорошего",
+            "до свидания",
+            "пока"
+        ]
+        
+        if any(phrase in answer.lower() for phrase in ending_phrases):
+            # Катя пытается закончить разговор - генерируем продолжение
+            continuation = generate_conversation_continuation(user_text, user_facts)
+            answer = f"{answer}\n\n{continuation}"
+            logger.info(f"Added conversation continuation: {continuation}")
+        
+        return answer
+        
+    except Exception as e:
+        logger.error(f"Error in LLM reply: {e}")
+        return "Извини, у меня сейчас технические проблемы. Попробуй позже! 😅"
+
+# 4. Добавляю функцию get_recent_messages если её нет
+def get_recent_messages(chat_id: int, limit: int = 20) -> list:
+    """Получение последних сообщений для контекста"""
+    try:
+        with engine.begin() as conn:
+            rows = conn.execute(
+                text(f"""
+                    SELECT {M['role']}, {M['content']}, {M['created_at']}
+                    FROM {MESSAGES_TABLE}
+                    WHERE {M['chat_id']} = :chat_id
+                    ORDER BY {M['created_at']} DESC
+                    LIMIT :limit
+                """),
+                {"chat_id": chat_id, "limit": limit},
+            ).fetchall()
+            
+            messages = []
+            for row in rows:
+                messages.append({
+                    "role": row[0],
+                    "content": row[1],
+                    "created_at": row[2]
+                })
+            
+            return messages
+    except Exception as e:
+        logger.error(f"Error getting recent messages: {e}")
+        return []
