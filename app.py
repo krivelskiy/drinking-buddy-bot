@@ -119,6 +119,18 @@ def init_db():
                 ADD COLUMN IF NOT EXISTS sticker_sent TEXT
             """))
             
+            # Добавляем колонку preferences к users если её нет
+            conn.execute(DDL(f"""
+                ALTER TABLE {USERS_TABLE} 
+                ADD COLUMN IF NOT EXISTS preferences TEXT
+            """))
+            
+            # Добавляем колонку last_preference_ask к users если её нет
+            conn.execute(DDL(f"""
+                ALTER TABLE {USERS_TABLE} 
+                ADD COLUMN IF NOT EXISTS last_preference_ask DATE
+            """))
+            
         except Exception as e:
             logger.warning(f"Some columns might already exist: {e}")
         
@@ -440,6 +452,12 @@ async def llm_reply(user_text: str, username: Optional[str], user_tg_id: int, ch
             {"role": "system", "content": SYSTEM_PROMPT},
         ]
         
+        # Получаем предпочтения пользователя
+        user_preferences = get_user_preferences(user_tg_id)
+        
+        # Проверяем, нужно ли спрашивать о предпочтениях
+        should_ask_prefs = should_ask_preferences(user_tg_id)
+        
         # Добавляем информацию о пользователе
         if user_age:
             messages.append({"role": "system", "content": f"Пользователю {user_age} лет."})
@@ -449,9 +467,18 @@ async def llm_reply(user_text: str, username: Optional[str], user_tg_id: int, ch
         if user_name:
             messages.append({"role": "system", "content": f"Имя пользователя: {user_name}. Обращайся к нему по имени, а не по username."})
         
-        # Добавляем историю сообщений (в обратном порядке для правильной последовательности)
+        # Добавляем информацию о предпочтениях
+        if user_preferences:
+            messages.append({"role": "system", "content": f"Предпочтения пользователя в напитках: {user_preferences}. НЕ спрашивай о предпочтениях, используй эту информацию."})
+        elif should_ask_prefs:
+            messages.append({"role": "system", "content": "Можешь спросить о предпочтениях в напитках, но только один раз в этом разговоре."})
+            # Обновляем дату последнего вопроса
+            update_last_preference_ask(user_tg_id)
+        
+        # Добавляем историю сообщений (только ответы Кати для контекста)
         for msg in reversed(recent_messages[-3:]):  # только последние 3 сообщения
-            messages.append(msg)
+            if msg["role"] == "assistant":  # ТОЛЬКО ответы Кати, НЕ сообщения пользователя
+                messages.append(msg)
         
         messages.append({"role": "user", "content": user_text})
         
@@ -753,8 +780,17 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         try:
             update_user_age(user_tg_id, age)
             logger.info("Updated user age to %d", age)
-        except Exception:
+    except Exception:
             logger.exception("Failed to update user age")
+
+    # 3.5) Проверяем на упоминание предпочтений напитков
+    preferences = parse_drink_preferences(text_in)
+    if preferences:
+        try:
+            update_user_preferences(user_tg_id, preferences)
+            logger.info("Updated user preferences to %s", preferences)
+        except Exception:
+            logger.exception("Failed to update user preferences")
 
     # 4) Генерируем ответ через OpenAI
     answer, sticker_command = await llm_reply(text_in, username, user_tg_id, chat_id)
@@ -762,7 +798,7 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # 5) Отправляем ответ
     try:
         sent_message = await update.message.reply_text(answer)
-    except Exception:
+            except Exception:
         logger.exception("Failed to send reply")
         return
 
@@ -853,6 +889,89 @@ def get_last_user_tg_id(chat_id: int) -> Optional[int]:
             {"chat_id": chat_id}
         ).fetchone()
         return result[0] if result else None
+
+def get_user_preferences(user_tg_id: int) -> Optional[str]:
+    """Получить предпочтения пользователя"""
+    with engine.begin() as conn:
+        row = conn.execute(
+            text(f"SELECT preferences FROM {USERS_TABLE} WHERE {U['user_tg_id']} = :tg_id"),
+            {"tg_id": user_tg_id},
+        ).fetchone()
+        return row[0] if row and row[0] else None
+
+def update_user_preferences(user_tg_id: int, preferences: str) -> None:
+    """Обновить предпочтения пользователя"""
+    with engine.begin() as conn:
+        conn.execute(
+            text(f"""
+                UPDATE {USERS_TABLE}
+                SET preferences = :preferences
+                WHERE {U['user_tg_id']} = :tg_id
+            """),
+            {"tg_id": user_tg_id, "preferences": preferences},
+        )
+
+def get_last_preference_ask(user_tg_id: int) -> Optional[str]:
+    """Получить дату последнего вопроса о предпочтениях"""
+    with engine.begin() as conn:
+        row = conn.execute(
+            text(f"SELECT last_preference_ask FROM {USERS_TABLE} WHERE {U['user_tg_id']} = :tg_id"),
+            {"tg_id": user_tg_id},
+        ).fetchone()
+        return row[0] if row and row[0] else None
+
+def update_last_preference_ask(user_tg_id: int) -> None:
+    """Обновить дату последнего вопроса о предпочтениях"""
+    with engine.begin() as conn:
+        conn.execute(
+            text(f"""
+                UPDATE {USERS_TABLE}
+                SET last_preference_ask = CURRENT_DATE
+                WHERE {U['user_tg_id']} = :tg_id
+            """),
+            {"tg_id": user_tg_id},
+        )
+
+def should_ask_preferences(user_tg_id: int) -> bool:
+    """Проверить, нужно ли спрашивать о предпочтениях (максимум раз в сутки)"""
+    with engine.begin() as conn:
+        result = conn.execute(
+            text(f"""
+                SELECT CASE 
+                    WHEN last_preference_ask IS NULL OR last_preference_ask < CURRENT_DATE THEN true 
+                    ELSE false 
+                END
+                FROM {USERS_TABLE} 
+                WHERE {U['user_tg_id']} = :tg_id
+            """),
+            {"tg_id": user_tg_id}
+        ).fetchone()
+        return result[0] if result else True
+
+def parse_drink_preferences(text: str) -> Optional[str]:
+    """Парсить предпочтения напитков из текста"""
+    text_lower = text.lower()
+    
+    drinks = {
+        "пиво": ["пиво", "пивко", "пивка", "🍺"],
+        "вино": ["вино", "винца", "винцо", "🍷"],
+        "водка": ["водка", "водочка", "🍸"],
+        "виски": ["виски", "вискарь", "🥃"],
+        "шампанское": ["шампанское", "🍾"],
+        "коньяк": ["коньяк", "коньячок"],
+        "ром": ["ром", "ромчик"],
+        "джин": ["джин", "джинчик"]
+    }
+    
+    found_drinks = []
+    for drink_name, keywords in drinks.items():
+        if any(keyword in text_lower for keyword in keywords):
+            found_drinks.append(drink_name)
+    
+    if found_drinks:
+        return ", ".join(found_drinks)
+    
+    return None
 
 # -----------------------------
 # FastAPI приложение
