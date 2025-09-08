@@ -661,8 +661,6 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # 2) Сохраняем сообщение пользователя
     try:
-        answer, sticker_command = await llm_reply(text_in, username, user_tg_id, chat_id)
-        sent_message = await update.message.reply_text(answer)
         save_message(chat_id, user_tg_id, "user", text_in, message_id)
     except Exception:
         logger.exception("Failed to save user message")
@@ -677,15 +675,14 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             logger.exception("Failed to update user age")
 
     # 4) Генерируем ответ через OpenAI
-    # answer, sticker_command = await llm_reply(text_in, username, user_tg_id, chat_id) # This line is now redundant
+    answer, sticker_command = await llm_reply(text_in, username, user_tg_id, chat_id)
 
     # 5) Отправляем ответ
     try:
         sent_message = await update.message.reply_text(answer)
-        # Сохраняем ответ бота
-        save_message(chat_id, user_tg_id, "assistant", answer, sent_message.message_id)
     except Exception:
         logger.exception("Failed to send reply")
+        return
 
     # 6) Отправляем стикер если LLM решил что нужно
     if sticker_command:
@@ -720,8 +717,9 @@ def get_alcohol_sticker_count(user_tg_id: int) -> int:
 def should_ask_for_gift(user_tg_id: int) -> bool:
     """Проверяет, нужно ли просить подарок (каждые 3 стикера алкоголя)"""
     count = get_alcohol_sticker_count(user_tg_id)
-    logger.info(f"Checking gift request for user {user_tg_id}: count={count}, should_ask={count > 0 and count % 3 == 0}")
-    return count > 0 and count % 3 == 0
+    should_ask = count > 0 and count % 3 == 0
+    logger.info(f"Checking gift request for user {user_tg_id}: count={count}, should_ask={should_ask}")
+    return should_ask
 
 async def send_gift_request(chat_id: int, user_tg_id: int) -> None:
     """Отправляет сообщение с просьбой о подарке и кнопкой"""
@@ -739,15 +737,22 @@ async def send_gift_request(chat_id: int, user_tg_id: int) -> None:
         " Нажми кнопку ниже, чтобы выбрать напиток для меня:"
     ]
     
-    # Отправляем сообщение с кнопкой
+    # Отправляем сообщение с кнопкой через Telegram API
     async with httpx.AsyncClient() as client:
         try:
+            # Конвертируем InlineKeyboardMarkup в словарь
+            keyboard_dict = {
+                "inline_keyboard": [
+                    [{"text": "🎁 Купить подарок Кате", "callback_data": "gift_menu"}]
+                ]
+            }
+            
             response = await client.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                 json={
                     "chat_id": chat_id,
                     "text": "\n".join(messages),
-                    "reply_markup": reply_markup
+                    "reply_markup": keyboard_dict
                 }
             )
             response.raise_for_status()
