@@ -83,6 +83,7 @@ def init_db():
         conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS preferences TEXT"))
         conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS last_preference_ask DATE"))
         conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS last_holiday_suggest TIMESTAMPTZ"))
+        conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS last_auto_message TIMESTAMPTZ"))
     
     logger.info("✅ Database tables created/verified")
 
@@ -234,6 +235,123 @@ def update_last_holiday_suggest(user_tg_id: int) -> None:
             """),
             {"tg_id": user_tg_id}
         )
+
+# -----------------------------
+# Система автоматических сообщений
+# -----------------------------
+def get_users_for_auto_message() -> list[dict]:
+    """Получить пользователей, которым нужно отправить автоматическое сообщение"""
+    with engine.begin() as conn:
+        # Ищем пользователей, с которыми не общались более 24 часов
+        query = f"""
+            SELECT DISTINCT u.user_tg_id, u.chat_id, u.first_name, u.preferences
+            FROM {USERS_TABLE} u
+            LEFT JOIN (
+                SELECT user_tg_id, MAX(created_at) as last_message_time
+                FROM {MESSAGES_TABLE}
+                GROUP BY user_tg_id
+            ) m ON u.user_tg_id = m.user_tg_id
+            WHERE m.last_message_time IS NULL 
+               OR m.last_message_time < NOW() - INTERVAL '24 hours'
+               OR u.last_auto_message IS NULL 
+               OR u.last_auto_message < NOW() - INTERVAL '24 hours'
+        """
+        
+        rows = conn.execute(text(query)).fetchall()
+        return [
+            {
+                "user_tg_id": row[0],
+                "chat_id": row[1], 
+                "first_name": row[2],
+                "preferences": row[3]
+            }
+            for row in rows
+        ]
+
+def generate_auto_message(first_name: str, preferences: Optional[str]) -> str:
+    """Генерировать заманчивое сообщение для пользователя"""
+    messages = [
+        f"Привет, {first_name}! Соскучилась по нашим разговорам 😊 Давай выпьем и поболтаем?",
+        f"Эй, {first_name}! У меня есть отличная идея - давай отметим что-нибудь! 🍻",
+        f"{first_name}, я тут думаю... а не выпить ли нам? 😉",
+        f"Привет! Скучаю по нашей компании, {first_name}! Давай встретимся за рюмочкой?",
+        f"Эй, {first_name}! У меня настроение праздновать! Присоединяешься? 🥂",
+        f"Привет! Давай устроим вечеринку на двоих, {first_name}! 🎉",
+        f"{first_name}, я тут одна сижу... не соскучишься ли по мне? 😘",
+        f"Эй! У меня есть повод выпить! Хочешь узнать какой, {first_name}? 🍷",
+        f"Привет, {first_name}! Давай отметим что-нибудь хорошее! 🥃",
+        f"{first_name}, я тут думаю о тебе... а не выпить ли нам вместе? 😊"
+    ]
+    
+    # Если есть предпочтения, добавляем их в сообщение
+    if preferences:
+        pref_messages = [
+            f"Привет, {first_name}! У меня есть твое любимое {preferences}! Давай выпьем? 🍻",
+            f"Эй, {first_name}! Я приготовила {preferences} специально для тебя! 😘",
+            f"{first_name}, помнишь как ты любишь {preferences}? Давай отметим! 🥂",
+            f"Привет! У меня есть {preferences} - твой любимый напиток! Присоединяешься? 🥂"
+        ]
+        messages.extend(pref_messages)
+    
+    import random
+    return random.choice(messages)
+
+def update_last_auto_message(user_tg_id: int) -> None:
+    """Обновить дату последнего автоматического сообщения"""
+    with engine.begin() as conn:
+        conn.execute(
+            text(f"""
+                UPDATE {USERS_TABLE}
+                SET last_auto_message = NOW()
+                WHERE {U['user_tg_id']} = :tg_id
+            """),
+            {"tg_id": user_tg_id}
+        )
+
+async def send_auto_messages():
+    """Отправить автоматические сообщения пользователям"""
+    try:
+        users = get_users_for_auto_message()
+        logger.info(f"Found {len(users)} users for auto messages")
+        
+        for user in users:
+            try:
+                message = generate_auto_message(user["first_name"] or "друг", user["preferences"])
+                
+                # Отправляем сообщение через Telegram API
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(
+                        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                        json={
+                            "chat_id": user["chat_id"],
+                            "text": message
+                        }
+                    )
+                    
+                    if response.status_code == 200:
+                        logger.info(f"Auto message sent to user {user['user_tg_id']}: {message[:50]}...")
+                        update_last_auto_message(user["user_tg_id"])
+                        
+                        # Сохраняем сообщение в БД
+                        save_message(user["chat_id"], user["user_tg_id"], "assistant", message, None)
+                    else:
+                        logger.warning(f"Failed to send auto message to user {user['user_tg_id']}: {response.text}")
+                        
+            except Exception as e:
+                logger.exception(f"Error sending auto message to user {user['user_tg_id']}: {e}")
+                
+    except Exception as e:
+        logger.exception(f"Error in send_auto_messages: {e}")
+
+async def auto_message_scheduler():
+    """Планировщик автоматических сообщений - каждые 2 часа"""
+    while True:
+        try:
+            await send_auto_messages()
+            await asyncio.sleep(2 * 60 * 60)  # 2 часа
+        except Exception as e:
+            logger.exception(f"Error in auto_message_scheduler: {e}")
+            await asyncio.sleep(60)  # При ошибке ждем минуту
 
 # -----------------------------
 # Telegram Application
@@ -1108,30 +1226,26 @@ async def telegram_webhook(token: str, request: Request):
 # -----------------------------
 @app.on_event("startup")
 async def on_startup():
-    global tapp
+    """Инициализация при запуске"""
+    logger.info("🚀 Starting application...")
     
-    # Инициализируем БД
-    try:
-        init_db()
-    except Exception:
-        logger.exception("Failed to initialize database")
+    # Инициализация БД
+    init_db()
     
-    tapp = build_application()
-    await tapp.initialize()
-    await tapp.start()
-
-    # Запускаем ping-бот в фоне
+    # Инициализация Telegram приложения
+    app = build_application()
+    await app.initialize()
+    await app.start()
+    
+    # Установка webhook
+    webhook_url = f"{RENDER_EXTERNAL_URL}/webhook/{BOT_TOKEN}"
+    await app.bot.set_webhook(webhook_url)
+    logger.info(f"✅ Webhook set to {webhook_url}")
+    
+    # Запуск планировщиков
     asyncio.create_task(ping_scheduler())
-
-    # Ставим вебхук, если можем вычислить внешний URL
-    if RENDER_EXTERNAL_URL:
-        try:
-            await tapp.bot.set_webhook(f"{RENDER_EXTERNAL_URL}/webhook/{BOT_TOKEN}")
-            logger.info("✅ Webhook set to %s/webhook/%s", RENDER_EXTERNAL_URL, BOT_TOKEN)
-        except Exception:
-            logger.exception("Failed to set webhook")
-    else:
-        logger.warning("RENDER_EXTERNAL_URL is empty — webhook не установлен")
+    asyncio.create_task(auto_message_scheduler())
+    logger.info("✅ Auto message scheduler started")
 
 @app.on_event("shutdown")
 async def on_shutdown():
