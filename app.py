@@ -358,7 +358,7 @@ async def llm_reply(user_text: str, username: Optional[str], user_tg_id: int, ch
         
         # Добавляем инструкцию о стикерах
         messages.append({"role": "system", "content": """
-СТИКЕРЫ: Если пьете алкоголь или тостите, добавь в конец ответа:
+ОБЯЗАТЕЛЬНО: Если упоминается вино, водка, виски, пиво или тосты - добавь в конец ответа команду:
 - [SEND_DRINK_WINE] для вина
 - [SEND_DRINK_VODKA] для водки  
 - [SEND_DRINK_WHISKY] для виски
@@ -366,7 +366,7 @@ async def llm_reply(user_text: str, username: Optional[str], user_tg_id: int, ch
 - [SEND_KATYA_HAPPY] когда радуешься
 - [SEND_KATYA_SAD] когда грустишь
 
-Команда будет удалена из ответа пользователю.
+Команда будет удалена из ответа пользователю. НЕ ЗАБУДЬ добавить команду!
 """})
         
         # Добавляем историю сообщений (в обратном порядке для правильной последовательности)
@@ -386,6 +386,9 @@ async def llm_reply(user_text: str, username: Optional[str], user_tg_id: int, ch
         
         response_text = resp.choices[0].message.content.strip()
         
+        # Логируем полный ответ LLM для диагностики
+        logger.info(f"LLM raw response for user {user_tg_id}: '{response_text}'")
+        
         # Проверяем наличие команды стикера
         sticker_commands = [
             "[SEND_DRINK_VODKA]", "[SEND_DRINK_WHISKY]", "[SEND_DRINK_WINE]", "[SEND_DRINK_BEER]",
@@ -400,6 +403,9 @@ async def llm_reply(user_text: str, username: Optional[str], user_tg_id: int, ch
                 response_text = response_text.replace(cmd, "").strip()
                 logger.info(f"LLM requested sticker: {cmd} for user {user_tg_id}")
                 break
+        
+        if not sticker_command:
+            logger.info(f"No sticker command found in LLM response for user {user_tg_id}")
         
         return response_text, sticker_command
         
