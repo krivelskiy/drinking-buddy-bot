@@ -562,6 +562,17 @@ def get_user_age(user_tg_id: int) -> Optional[int]:
         logger.info(f"Retrieved age for user {user_tg_id}: {age}")
         return age
 
+def get_user_name(user_tg_id: int) -> Optional[str]:
+    """Получение имени пользователя из БД"""
+    with engine.begin() as conn:
+        row = conn.execute(
+            text(f"SELECT {U['first_name']} FROM {USERS_TABLE} WHERE {U['user_tg_id']} = :tg_id"),
+            {"tg_id": user_tg_id},
+        ).fetchone()
+        name = row[0] if row and row[0] else None
+        logger.info(f"Retrieved name for user {user_tg_id}: {name}")
+        return name
+
 def update_user_age(user_tg_id: int, age: int) -> None:
     """Обновление возраста пользователя в БД"""
     with engine.begin() as conn:
