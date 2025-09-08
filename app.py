@@ -162,9 +162,9 @@ def upsert_user_from_update(update: Update) -> None:
     last_name = update.message.from_user.last_name
 
     with engine.begin() as conn:
-        # Проверяем существует ли пользователь
+        # Проверяем существует ли пользователь по PRIMARY KEY (tg_id)
         existing = conn.execute(
-            text(f"SELECT {U['user_tg_id']} FROM {USERS_TABLE} WHERE {U['user_tg_id']} = :tg_id"),
+            text(f"SELECT tg_id FROM {USERS_TABLE} WHERE tg_id = :tg_id"),
             {"tg_id": tg_id},
         ).fetchone()
 
@@ -173,8 +173,8 @@ def upsert_user_from_update(update: Update) -> None:
             conn.execute(
                 text(f"""
                     UPDATE {USERS_TABLE}
-                    SET {U['username']} = :username, {U['first_name']} = :first_name, {U['last_name']} = :last_name, {U['chat_id']} = :chat_id, tg_id = :tg_id
-                    WHERE {U['user_tg_id']} = :tg_id
+                    SET {U['username']} = :username, {U['first_name']} = :first_name, {U['last_name']} = :last_name, {U['chat_id']} = :chat_id, {U['user_tg_id']} = :tg_id
+                    WHERE tg_id = :tg_id
                 """),
                 {
                     "tg_id": tg_id,
