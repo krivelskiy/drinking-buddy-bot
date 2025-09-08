@@ -13,7 +13,7 @@ from sqlalchemy import create_engine, text, DDL
 from sqlalchemy.engine import Engine
 
 from telegram import Update
-from telegram.ext import Application, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, MessageHandler, ContextTypes, filters, CommandHandler, CallbackQueryHandler, PreCheckoutQueryHandler
 
 from openai import OpenAI
 
@@ -434,6 +434,133 @@ async def send_sticker_by_command(chat_id: int, sticker_command: str) -> None:
             logger.info(f"Sent sticker {sticker_command} to chat {chat_id}")
         except Exception as e:
             logger.exception(f"Failed to send sticker {sticker_command}: {e}")
+
+async def gift_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик команды /gift - покупка алкоголя за звезды"""
+    if not update.message:
+        return
+    
+    chat_id = update.message.chat_id
+    user_tg_id = update.message.from_user.id
+    
+    logger.info(f"Gift command received from user {user_tg_id}")
+    
+    # Создаем инлайн клавиатуру с вариантами напитков
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("🍷 Вино (1 ⭐)", callback_data="gift_wine"),
+            InlineKeyboardButton("🍸 Водка (1 ⭐)", callback_data="gift_vodka")
+        ],
+        [
+            InlineKeyboardButton("🥃 Виски (1 ⭐)", callback_data="gift_whisky"),
+            InlineKeyboardButton("🍺 Пиво (1 ⭐)", callback_data="gift_beer")
+        ]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "🎁 Выбери напиток для Кати:\n\n"
+        "Катя будет очень рада получить от тебя подарок! 💕\n"
+        "Все напитки стоят всего 1 звезду! ⭐",
+        reply_markup=reply_markup
+    )
+
+async def gift_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик нажатий на кнопки подарков"""
+    query = update.callback_query
+    if not query:
+        return
+    
+    await query.answer()
+    
+    user_tg_id = query.from_user.id
+    chat_id = query.message.chat_id
+    data = query.data
+    
+    logger.info(f"Gift callback from user {user_tg_id}: {data}")
+    
+    # Определяем напиток и стоимость (все по 1 звезде)
+    drink_info = {
+        "gift_wine": {"name": "🍷 Вино", "stars": 1, "sticker": "[SEND_DRINK_WINE]"},
+        "gift_vodka": {"name": "🍸 Водка", "stars": 1, "sticker": "[SEND_DRINK_VODKA]"},
+        "gift_whisky": {"name": "�� Виски", "stars": 1, "sticker": "[SEND_DRINK_WHISKY]"},
+        "gift_beer": {"name": "🍺 Пиво", "stars": 1, "sticker": "[SEND_DRINK_BEER]"}
+    }
+    
+    if data not in drink_info:
+        await query.edit_message_text("❌ Неизвестный напиток")
+        return
+    
+    drink = drink_info[data]
+    
+    # Создаем инлайн клавиатуру для оплаты
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    
+    keyboard = [
+        [InlineKeyboardButton(f"💳 Оплатить {drink['stars']} ⭐", pay=True)]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        f"🎁 Подарок для Кати: {drink['name']}\n\n"
+        f"Стоимость: {drink['stars']} ⭐\n\n"
+        f"Катя будет в восторге! 💕\n"
+        f"Нажми кнопку ниже для оплаты:",
+        reply_markup=reply_markup
+    )
+
+async def pre_checkout_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик предварительной проверки платежа"""
+    query = update.pre_checkout_query
+    if not query:
+        return
+    
+    logger.info(f"Pre-checkout query: {query.invoice_payload}")
+    
+    # Подтверждаем платеж
+    await query.answer(ok=True)
+
+async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик успешного платежа"""
+    if not update.message or not update.message.successful_payment:
+        return
+    
+    payment = update.message.successful_payment
+    user_tg_id = update.message.from_user.id
+    chat_id = update.message.chat_id
+    
+    logger.info(f"Successful payment from user {user_tg_id}: {payment.invoice_payload}")
+    
+    # Определяем какой напиток был куплен
+    drink_info = {
+        "wine": {"name": "🍷 Вино", "sticker": "[SEND_DRINK_WINE]"},
+        "vodka": {"name": "🍸 Водка", "sticker": "[SEND_DRINK_VODKA]"},
+        "whisky": {"name": "🥃 Виски", "sticker": "[SEND_DRINK_WHISKY]"},
+        "beer": {"name": "🍺 Пиво", "sticker": "[SEND_DRINK_BEER]"}
+    }
+    
+    drink_type = payment.invoice_payload
+    if drink_type not in drink_info:
+        drink_type = "wine"  # fallback
+    
+    drink = drink_info[drink_type]
+    
+    # Отправляем благодарность
+    await update.message.reply_text(
+        f"🎉 Спасибо за подарок!\n\n"
+        f"Катя получила {drink['name']} и очень рада! 💕\n"
+        f"Она обязательно отблагодарит тебя! 😊"
+    )
+    
+    # Отправляем стикер
+    try:
+        await send_sticker_by_command(chat_id, drink['sticker'])
+    except Exception as e:
+        logger.exception(f"Failed to send gift sticker: {e}")
 
 # -----------------------------
 # Хендлер сообщений
