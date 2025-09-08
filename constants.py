@@ -39,6 +39,7 @@ DB_FIELDS = MappingProxyType({
     "users": {
         "id": "id",
         "user_tg_id": "user_tg_id",
+        "chat_id": "chat_id",
         "username": "username",
         "first_name": "first_name",
         "last_name": "last_name",
