@@ -59,10 +59,12 @@ def load_system_prompt() -> str:
     """Загрузка системного промпта из Context.txt"""
     try:
         with open("Context.txt", "r", encoding="utf-8") as f:
-            return f.read().strip()
+            base_prompt = f.read().strip()
+        # Добавляем требование говорить только на русском
+        return base_prompt + "\n\nВАЖНО: Отвечай ТОЛЬКО на русском языке. Никогда не используй английские слова или фразы в ответах."
     except Exception as e:
         logger.error(f"Failed to load system prompt: {e}")
-        return "Ты — Катя Собутыльница: живая девушка, дружелюбная, немного флиртуешь, любишь пошутить и выпить."
+        return "Ты — Катя Собутыльница: живая девушка, дружелюбная, немного флиртуешь, любишь пошутить и выпить. Отвечай ТОЛЬКО на русском языке."
 
 SYSTEM_PROMPT = load_system_prompt()
 
