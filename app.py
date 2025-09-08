@@ -505,23 +505,18 @@ async def gift_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def gift_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик нажатий на кнопки подарков"""
     query = update.callback_query
-    if not query:
-        return
-    
     await query.answer()
     
-    user_tg_id = query.from_user.id
-    chat_id = query.message.chat_id
+    user_id = query.from_user.id
     data = query.data
     
-    logger.info(f"Gift callback from user {user_tg_id}: {data}")
+    logger.info(f"Gift callback from user {user_id}: {data}")
     
-    # Если это кнопка открытия меню подарков
     if data == "gift_menu":
         await show_gift_menu(query)
         return
     
-    # Определяем напиток и стоимость (все по 1 звезде)
+    # Информация о напитках
     drink_info = {
         "gift_wine": {"name": "🍷 Вино", "stars": 1, "sticker": "[SEND_DRINK_WINE]"},
         "gift_vodka": {"name": "🍸 Водка", "stars": 1, "sticker": "[SEND_DRINK_VODKA]"},
@@ -544,13 +539,20 @@ async def gift_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await query.edit_message_text(
+    # Отправляем НОВОЕ сообщение с кнопками оплаты вместо редактирования
+    await query.message.reply_text(
         f"🎁 Подарок для Кати: {drink['name']}\n\n"
         f"Стоимость: {drink['stars']} ⭐\n\n"
         f"Катя будет в восторге! 💕\n"
         f"Нажми кнопку ниже для оплаты:",
         reply_markup=reply_markup
     )
+    
+    # Удаляем старое сообщение с меню
+    try:
+        await query.message.delete()
+    except Exception as e:
+        logger.exception(f"Failed to delete old message: {e}")
 
 async def show_gift_menu(query) -> None:
     """Показывает меню подарков"""
