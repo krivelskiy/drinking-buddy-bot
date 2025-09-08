@@ -121,6 +121,17 @@ def init_db():
             
         except Exception as e:
             logger.warning(f"Some columns might already exist: {e}")
+        
+        # Создание таблицы для бесплатных напитков Кати
+        conn.execute(DDL(f"""
+            CREATE TABLE IF NOT EXISTS katya_free_drinks (
+                id SERIAL PRIMARY KEY,
+                chat_id BIGINT NOT NULL,
+                drinks_used INTEGER DEFAULT 0,
+                date_reset DATE DEFAULT CURRENT_DATE,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """))
     
     logger.info("✅ Database tables created/verified")
 
@@ -136,6 +147,49 @@ if OPENAI_API_KEY:
         logger.exception("OpenAI init failed: %s", e)
 else:
     logger.warning("OPENAI_API_KEY is empty — ответы будут с заглушкой")
+
+# -----------------------------
+# Функции для бесплатных напитков Кати
+# -----------------------------
+
+def get_katya_drinks_count(chat_id: int) -> int:
+    """Получить количество использованных бесплатных напитков Кати за сегодня"""
+    with engine.begin() as conn:
+        result = conn.execute(text(f"""
+            SELECT drinks_used FROM katya_free_drinks 
+            WHERE chat_id = :chat_id AND date_reset = CURRENT_DATE
+        """), {"chat_id": chat_id}).fetchone()
+        
+        if result:
+            return result[0]
+        return 0
+
+def increment_katya_drinks(chat_id: int) -> None:
+    """Увеличить счетчик бесплатных напитков Кати"""
+    with engine.begin() as conn:
+        # Проверяем, есть ли запись на сегодня
+        result = conn.execute(text(f"""
+            SELECT id FROM katya_free_drinks 
+            WHERE chat_id = :chat_id AND date_reset = CURRENT_DATE
+        """), {"chat_id": chat_id}).fetchone()
+        
+        if result:
+            # Обновляем существующую запись
+            conn.execute(text(f"""
+                UPDATE katya_free_drinks 
+                SET drinks_used = drinks_used + 1 
+                WHERE chat_id = :chat_id AND date_reset = CURRENT_DATE
+            """), {"chat_id": chat_id})
+        else:
+            # Создаем новую запись
+            conn.execute(text(f"""
+                INSERT INTO katya_free_drinks (chat_id, drinks_used, date_reset) 
+                VALUES (:chat_id, 1, CURRENT_DATE)
+            """), {"chat_id": chat_id})
+
+def can_katya_drink_free(chat_id: int) -> bool:
+    """Проверить, может ли Катя выпить бесплатно (лимит 5 напитков в день)"""
+    return get_katya_drinks_count(chat_id) < 5
 
 # -----------------------------
 # Telegram Application
@@ -715,16 +769,20 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         logger.exception("Failed to send reply")
         return
 
-    # 6) Отправляем стикер если LLM решил что нужно
+    # 6) Отправляем стикер если нужно
     if sticker_command:
-        try:
-            await send_sticker_by_command(chat_id, sticker_command)
-            # Сохраняем ответ бота с информацией о стикере
-            save_message(chat_id, user_tg_id, "assistant", answer, sent_message.message_id, None, sticker_command)
-        except Exception:
-            logger.exception("Failed to send sticker")
-            # Сохраняем ответ бота без стикера
-            save_message(chat_id, user_tg_id, "assistant", answer, sent_message.message_id)
+        await send_sticker_by_command(chat_id, sticker_command)
+            
+        # Увеличиваем счетчик бесплатных напитков Кати
+        increment_katya_drinks(chat_id)
+            
+        # Проверяем лимит бесплатных напитков Кати
+        if not can_katya_drink_free(chat_id):
+            # Катя исчерпала лимит бесплатных напитков
+            await send_gift_request(chat_id, user_tg_id)
+        
+        # Сохраняем ответ бота с информацией о стикере
+        save_message(chat_id, user_tg_id, "assistant", answer, sent_message.message_id, None, sticker_command)
     else:
         # Сохраняем ответ бота без стикера
         save_message(chat_id, user_tg_id, "assistant", answer, sent_message.message_id)
@@ -753,19 +811,10 @@ def should_ask_for_gift(user_tg_id: int) -> bool:
     return should_ask
 
 async def send_gift_request(chat_id: int, user_tg_id: int) -> None:
-    """Отправляет сообщение с просьбой о подарке и кнопкой"""
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    
-    keyboard = [
-        [InlineKeyboardButton("🎁 Купить подарок Кате", callback_data="gift_menu")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
+    """Отправить запрос на подарок когда у Кати закончились бесплатные напитки"""
     messages = [
-        "😔 У меня заканчиваются мои напитки...",
-        "🍷 Может быть, ты угостишь меня чем-нибудь вкусненьким?",
-        "💕 Я буду очень благодарна за любой подарок!",
-        " Нажми кнопку ниже, чтобы выбрать напиток для меня:"
+        "Я бы хотела с тобой выпить, но у меня на сегодня закончились напитки 😔",
+        "Можешь купить мне что-нибудь выпить? 🍷"
     ]
     
     # Отправляем сообщение с кнопкой через Telegram API
