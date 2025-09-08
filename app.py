@@ -2129,6 +2129,11 @@ def generate_conversation_continuation(user_text: str, user_facts: str) -> str:
 def llm_reply(user_text: str, user_tg_id: int, chat_id: int, recent_messages: list) -> str:
     """Генерация ответа через LLM"""
     try:
+        # Проверяем что recent_messages это список
+        if not isinstance(recent_messages, list):
+            logger.error(f"recent_messages is not a list: {type(recent_messages)}")
+            recent_messages = []
+        
         # Получаем факты о пользователе
         user_facts = get_user_facts(user_tg_id)
         
