@@ -698,11 +698,11 @@ def get_user_facts(user_tg_id: int) -> str:
     if name:
         facts.append(f"Имя: {name}")
     
-    # Статистика выпитого за день
-    daily_drinks = get_daily_drinks(user_tg_id)
-    if daily_drinks:
-        daily_total = sum(drink['amount'] for drink in daily_drinks)
-        facts.append(f"Выпито сегодня: {daily_total} порций")
+    # УБИРАЕМ статистику выпитого из фактов - она мешает LLM
+    # daily_drinks = get_daily_drinks(user_tg_id)
+    # if daily_drinks:
+    #     daily_total = sum(drink['amount'] for drink in daily_drinks)
+    #     facts.append(f"Выпито сегодня: {daily_total} порций")
     
     return ", ".join(facts) if facts else ""
 
@@ -1740,25 +1740,25 @@ def parse_drink_info(text: str) -> Optional[dict]:
             'девять': 9, 'десять': 10
         }
         
-        # Паттерны для разных напитков и единиц измерения
+        # ВАЖНО: Специфичные паттерны ДОЛЖНЫ быть ПЕРВЫМИ!
         patterns = [
-            # Пиво
+            # Пиво - специфичные паттерны
             (r'выпил\s+(\d+|[а-я]+)\s*(?:стакан|бокал|банк|бутылк|л|мл)?\s*(?:пива|пивка)', 'пиво', 'стакан'),
             (r'(\d+|[а-я]+)\s*(?:стакан|бокал|банк|бутылк|л|мл)?\s*(?:пива|пивка)', 'пиво', 'стакан'),
             
-            # Вино
+            # Вино - специфичные паттерны
             (r'выпил\s+(\d+|[а-я]+)\s*(?:бокал|стакан|л|мл)?\s*(?:вина|винца)', 'вино', 'бокал'),
             (r'(\d+|[а-я]+)\s*(?:бокал|стакан|л|мл)?\s*(?:вина|винца)', 'вино', 'бокал'),
             
-            # Водка
+            # Водка - специфичные паттерны
             (r'выпил\s+(\d+|[а-я]+)\s*(?:рюмк|стакан|л|мл)?\s*(?:водки|водочки)', 'водка', 'рюмка'),
             (r'(\d+|[а-я]+)\s*(?:рюмк|стакан|л|мл)?\s*(?:водки|водочки)', 'водка', 'рюмка'),
             
-            # Виски
+            # Виски - специфичные паттерны
             (r'выпил\s+(\d+|[а-я]+)\s*(?:рюмк|стакан|л|мл)?\s*(?:виски|вискаря)', 'виски', 'рюмка'),
             (r'(\d+|[а-я]+)\s*(?:рюмк|стакан|л|мл)?\s*(?:виски|вискаря)', 'виски', 'рюмка'),
             
-            # Общие паттерны
+            # Общие паттерны - В КОНЦЕ!
             (r'выпил\s+(\d+|[а-я]+)\s*(?:стакан|бокал|рюмк|л|мл)', 'напиток', 'порция'),
             (r'(\d+|[а-я]+)\s*(?:стакан|бокал|рюмк|л|мл)', 'напиток', 'порция'),
         ]
@@ -1818,9 +1818,9 @@ def save_drink_record(user_tg_id: int, chat_id: int, drink_info: dict) -> None:
                 {"tg_id": user_tg_id},
             )
         
-        logger.info(f"Saved drink record: {drink_info}")
+        logger.info(f"✅ Saved drink record: {drink_info}")
     except Exception as e:
-        logger.error(f"Error saving drink record: {e}")
+        logger.error(f"❌ Error saving drink record: {e}")
 
 def get_daily_drinks(user_tg_id: int) -> list:
     """Получение выпитого за сегодня"""
