@@ -768,18 +768,21 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # 6) Отправляем стикер если нужно
     if sticker_command:
-        await send_sticker_by_command(chat_id, sticker_command)
+        # Проверяем, может ли Катя выпить бесплатно
+        if can_katya_drink_free(chat_id):
+            await send_sticker_by_command(chat_id, sticker_command)
             
-        # Увеличиваем счетчик бесплатных напитков Кати
-        increment_katya_drinks(chat_id)
+            # Увеличиваем счетчик бесплатных напитков Кати
+            increment_katya_drinks(chat_id)
             
-        # Проверяем лимит бесплатных напитков Кати
-        if not can_katya_drink_free(chat_id):
-            # Катя исчерпала лимит бесплатных напитков
+            # Сохраняем ответ бота с информацией о стикере
+            save_message(chat_id, user_tg_id, "assistant", answer, sent_message.message_id, None, sticker_command)
+        else:
+            # Катя исчерпала лимит бесплатных напитков - НЕ отправляем стикер
             await send_gift_request(chat_id, user_tg_id)
-        
-        # Сохраняем ответ бота с информацией о стикере
-        save_message(chat_id, user_tg_id, "assistant", answer, sent_message.message_id, None, sticker_command)
+            
+            # Сохраняем ответ бота БЕЗ стикера
+            save_message(chat_id, user_tg_id, "assistant", answer, sent_message.message_id)
     else:
         # Сохраняем ответ бота без стикера
         save_message(chat_id, user_tg_id, "assistant", answer, sent_message.message_id)
