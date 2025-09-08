@@ -1238,7 +1238,7 @@ async def root():
     return "OK"
 
 @app.post(f"/webhook/{{token}}")
-@safe_execute_sync
+@safe_execute  # Исправлено: используем async декоратор
 async def telegram_webhook(token: str, request: Request):
     """Webhook с защитой от ошибок"""
     if token != BOT_TOKEN:
