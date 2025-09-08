@@ -234,9 +234,6 @@ def build_application() -> Application:
     app_.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
     app_.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_handler))
     
-    # Запускаем ping-бот в фоне
-    asyncio.create_task(ping_scheduler())
-    
     return app_
 
 # -----------------------------
@@ -892,6 +889,9 @@ async def on_startup():
     tapp = build_application()
     await tapp.initialize()
     await tapp.start()
+
+    # Запускаем ping-бот в фоне
+    asyncio.create_task(ping_scheduler())
 
     # Ставим вебхук, если можем вычислить внешний URL
     if RENDER_EXTERNAL_URL:
