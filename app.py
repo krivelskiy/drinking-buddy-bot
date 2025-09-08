@@ -37,6 +37,20 @@ from constants import (
 error_counts = defaultdict(int)
 last_error_time = defaultdict(float)
 
+# -----------------------------
+# Системный промпт
+# -----------------------------
+def load_system_prompt() -> str:
+    """Загрузка системного промпта из Context.txt"""
+    try:
+        with open("Context.txt", "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception as e:
+        logger.error(f"Failed to load system prompt: {e}")
+        return "Ты — Катя Собутыльница: живая девушка, дружелюбная, немного флиртуешь, любишь пошутить и выпить."
+
+SYSTEM_PROMPT = load_system_prompt()
+
 def safe_execute(func):
     """Декоратор для безопасного выполнения функций"""
     @wraps(func)
