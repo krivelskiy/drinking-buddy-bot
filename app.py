@@ -1180,25 +1180,39 @@ def get_user_preferences(user_tg_id: int) -> Optional[str]:
         return row[0] if row and row[0] else None
 
 def update_user_preferences(user_tg_id: int, preferences: str) -> None:
-    """Обновить предпочтения пользователя"""
+    """Обновление предпочтений пользователя в БД"""
     with engine.begin() as conn:
         conn.execute(
             text(f"""
                 UPDATE {USERS_TABLE}
-                SET preferences = :preferences
+                SET {U['preferences']} = :preferences
                 WHERE {U['user_tg_id']} = :tg_id
             """),
             {"tg_id": user_tg_id, "preferences": preferences},
         )
+        logger.info(f"Updated preferences for user {user_tg_id} to {preferences}")
 
-def get_last_preference_ask(user_tg_id: int) -> Optional[str]:
-    """Получить дату последнего вопроса о предпочтениях"""
+def should_ask_preferences(user_tg_id: int) -> bool:
+    """Проверка, нужно ли спрашивать о предпочтениях (не чаще раза в день)"""
     with engine.begin() as conn:
         row = conn.execute(
-            text(f"SELECT last_preference_ask FROM {USERS_TABLE} WHERE {U['user_tg_id']} = :tg_id"),
+            text(f"""
+                SELECT {U['last_preference_ask']} 
+                FROM {USERS_TABLE} 
+                WHERE {U['user_tg_id']} = :tg_id
+            """),
             {"tg_id": user_tg_id},
         ).fetchone()
-        return row[0] if row and row[0] else None
+        
+        if not row or not row[0]:
+            # Если никогда не спрашивали - можно спросить
+            return True
+        
+        # Проверяем, прошла ли уже дата последнего вопроса
+        last_ask_date = row[0]
+        today = datetime.now().date()
+        
+        return last_ask_date < today
 
 def update_last_preference_ask(user_tg_id: int) -> None:
     """Обновление даты последнего вопроса о предпочтениях"""
