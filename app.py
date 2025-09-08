@@ -512,12 +512,12 @@ async def gift_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     
     keyboard = [
         [
-            InlineKeyboardButton("🍷 Вино (1 ⭐)", callback_data="gift_wine"),
-            InlineKeyboardButton("🍸 Водка (1 ⭐)", callback_data="gift_vodka")
+            InlineKeyboardButton("🍷 Вино (250 ⭐)", callback_data="gift_wine"),
+            InlineKeyboardButton("🍸 Водка (100 ⭐)", callback_data="gift_vodka")
         ],
         [
-            InlineKeyboardButton("🥃 Виски (1 ⭐)", callback_data="gift_whisky"),
-            InlineKeyboardButton("🍺 Пиво (1 ⭐)", callback_data="gift_beer")
+            InlineKeyboardButton("🥃 Виски (500 ⭐)", callback_data="gift_whisky"),
+            InlineKeyboardButton("🍺 Пиво (50 ⭐)", callback_data="gift_beer")
         ]
     ]
     
@@ -525,8 +525,7 @@ async def gift_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     
     await update.message.reply_text(
         "🎁 Выбери напиток для Кати:\n\n"
-        "Катя будет очень рада получить от тебя подарок! 💕\n"
-        "Все напитки стоят всего 1 звезду! ⭐",
+        "Катя будет очень рада получить от тебя подарок! 💕",
         reply_markup=reply_markup
     )
 
@@ -546,10 +545,10 @@ async def gift_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     
     # Информация о напитках
     drink_info = {
-        "gift_wine": {"name": "🍷 Вино", "stars": 1, "sticker": "[SEND_DRINK_WINE]"},
-        "gift_vodka": {"name": "🍸 Водка", "stars": 1, "sticker": "[SEND_DRINK_VODKA]"},
-        "gift_whisky": {"name": "🥃 Виски", "stars": 1, "sticker": "[SEND_DRINK_WHISKY]"},
-        "gift_beer": {"name": "🍺 Пиво", "stars": 1, "sticker": "[SEND_DRINK_BEER]"}
+        "gift_wine": {"name": "🍷 Вино", "stars": 250, "sticker": "[SEND_DRINK_WINE]"},
+        "gift_vodka": {"name": "🍸 Водка", "stars": 100, "sticker": "[SEND_DRINK_VODKA]"},
+        "gift_whisky": {"name": "🥃 Виски", "stars": 500, "sticker": "[SEND_DRINK_WHISKY]"},
+        "gift_beer": {"name": "🍺 Пиво", "stars": 50, "sticker": "[SEND_DRINK_BEER]"}
     }
     
     if data not in drink_info:
@@ -591,12 +590,12 @@ async def show_gift_menu(query) -> None:
     
     keyboard = [
         [
-            InlineKeyboardButton("🍷 Вино (1 ⭐)", callback_data="gift_wine"),
-            InlineKeyboardButton("🍸 Водка (1 ⭐)", callback_data="gift_vodka")
+            InlineKeyboardButton("🍷 Вино (250 ⭐)", callback_data="gift_wine"),
+            InlineKeyboardButton("🍸 Водка (100 ⭐)", callback_data="gift_vodka")
         ],
         [
-            InlineKeyboardButton("🥃 Виски (1 ⭐)", callback_data="gift_whisky"),
-            InlineKeyboardButton("🍺 Пиво (1 ⭐)", callback_data="gift_beer")
+            InlineKeyboardButton("🥃 Виски (500 ⭐)", callback_data="gift_whisky"),
+            InlineKeyboardButton("🍺 Пиво (50 ⭐)", callback_data="gift_beer")
         ]
     ]
     
@@ -604,8 +603,7 @@ async def show_gift_menu(query) -> None:
     
     await query.edit_message_text(
         "🎁 Выбери напиток для Кати:\n\n"
-        "Катя будет очень рада получить от тебя подарок! 💕\n"
-        "Все напитки стоят всего 1 звезду! ⭐",
+        "Катя будет очень рада получить от тебя подарок! 💕",
         reply_markup=reply_markup
     )
 
