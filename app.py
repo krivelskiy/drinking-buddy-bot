@@ -454,9 +454,11 @@ async def llm_reply(user_text: str, username: Optional[str], user_tg_id: int, ch
         
         # Получаем предпочтения пользователя
         user_preferences = get_user_preferences(user_tg_id)
+        logger.info(f"Retrieved preferences for user {user_tg_id}: {user_preferences}")
         
         # Проверяем, нужно ли спрашивать о предпочтениях
         should_ask_prefs = should_ask_preferences(user_tg_id)
+        logger.info(f"Should ask preferences for user {user_tg_id}: {should_ask_prefs}")
         
         # Добавляем информацию о пользователе
         if user_age:
@@ -470,8 +472,10 @@ async def llm_reply(user_text: str, username: Optional[str], user_tg_id: int, ch
         # Добавляем информацию о предпочтениях
         if user_preferences:
             messages.append({"role": "system", "content": f"Предпочтения пользователя в напитках: {user_preferences}. НЕ спрашивай о предпочтениях, используй эту информацию."})
+            logger.info(f"Added preferences to LLM prompt: {user_preferences}")
         elif should_ask_prefs:
             messages.append({"role": "system", "content": "Можешь спросить о предпочтениях в напитках, но только один раз в этом разговоре."})
+            logger.info(f"Added preference question prompt to LLM")
             # Обновляем дату последнего вопроса
             update_last_preference_ask(user_tg_id)
         
