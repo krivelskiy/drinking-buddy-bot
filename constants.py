@@ -44,6 +44,10 @@ DB_FIELDS = MappingProxyType({
         "first_name": "first_name",
         "last_name": "last_name",
         "age": "age",
+        "preferences": "preferences",
+        "last_preference_ask": "last_preference_ask",
+        "last_holiday_suggest": "last_holiday_suggest",
+        "last_auto_message": "last_auto_message",
         "created_at": "created_at"
     },
     "messages": {
@@ -54,7 +58,8 @@ DB_FIELDS = MappingProxyType({
         "content": "content",
         "created_at": "created_at",
         "reply_to_message_id": "reply_to_message_id",
-        "message_id": "message_id"
+        "message_id": "message_id",
+        "sticker_sent": "sticker_sent"
     }
 })
 
