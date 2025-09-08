@@ -2269,8 +2269,8 @@ def generate_new_topic(user_facts: str, day_info: dict) -> str:
 
 # На:
 # Получаем историю сообщений для контекста
-recent_messages = get_recent_messages(chat_id, limit=20)
-answer = llm_reply(text_in, user_tg_id, chat_id, recent_messages)
+# # recent_messages = get_recent_messages(chat_id, limit=20)
+# # answer = llm_reply(text_in, user_tg_id, chat_id, recent_messages)
 
 # 2. Добавляю недостающую функцию format_context_messages
 def format_context_messages(messages: list) -> str:
