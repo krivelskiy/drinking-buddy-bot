@@ -51,7 +51,6 @@ def init_db():
             CREATE TABLE IF NOT EXISTS {USERS_TABLE} (
                 id SERIAL PRIMARY KEY,
                 user_tg_id BIGINT UNIQUE NOT NULL,
-                chat_id BIGINT NOT NULL,
                 username TEXT,
                 first_name TEXT,
                 last_name TEXT,
@@ -70,80 +69,20 @@ def init_db():
                 content TEXT NOT NULL,
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 reply_to_message_id INTEGER,
-                message_id INTEGER,
-                sticker_sent TEXT
+                message_id INTEGER
             )
         """))
         
-        # Добавляем недостающие колонки к существующим таблицам
-        try:
-            # Добавляем колонку chat_id к users если её нет
-            conn.execute(DDL(f"""
-                ALTER TABLE {USERS_TABLE} 
-                ADD COLUMN IF NOT EXISTS chat_id BIGINT NOT NULL DEFAULT 0
-            """))
-            
-            # Добавляем колонку user_tg_id к users если её нет
-            conn.execute(DDL(f"""
-                ALTER TABLE {USERS_TABLE} 
-                ADD COLUMN IF NOT EXISTS user_tg_id BIGINT UNIQUE
-            """))
-            
-            # Добавляем колонку age к users если её нет
-            conn.execute(DDL(f"""
-                ALTER TABLE {USERS_TABLE} 
-                ADD COLUMN IF NOT EXISTS age INTEGER
-            """))
-            
-            # Добавляем колонку user_tg_id к messages если её нет
-            conn.execute(DDL(f"""
-                ALTER TABLE {MESSAGES_TABLE} 
-                ADD COLUMN IF NOT EXISTS user_tg_id BIGINT NOT NULL DEFAULT 0
-            """))
-            
-            # Добавляем колонку message_id к messages если её нет
-            conn.execute(DDL(f"""
-                ALTER TABLE {MESSAGES_TABLE} 
-                ADD COLUMN IF NOT EXISTS message_id INTEGER
-            """))
-            
-            # Добавляем колонку reply_to_message_id к messages если её нет
-            conn.execute(DDL(f"""
-                ALTER TABLE {MESSAGES_TABLE} 
-                ADD COLUMN IF NOT EXISTS reply_to_message_id INTEGER
-            """))
-            
-            # Добавляем колонку sticker_sent к messages если её нет
-            conn.execute(DDL(f"""
-                ALTER TABLE {MESSAGES_TABLE} 
-                ADD COLUMN IF NOT EXISTS sticker_sent TEXT
-            """))
-            
-            # Добавляем колонку preferences к users если её нет
-            conn.execute(DDL(f"""
-                ALTER TABLE {USERS_TABLE} 
-                ADD COLUMN IF NOT EXISTS preferences TEXT
-            """))
-            
-            # Добавляем колонку last_preference_ask к users если её нет
-            conn.execute(DDL(f"""
-                ALTER TABLE {USERS_TABLE} 
-                ADD COLUMN IF NOT EXISTS last_preference_ask DATE
-            """))
-            
-        except Exception as e:
-            logger.warning(f"Some columns might already exist: {e}")
-        
-        # Создание таблицы для бесплатных напитков Кати
-        conn.execute(DDL(f"""
-            CREATE TABLE IF NOT EXISTS katya_free_drinks (
-                id SERIAL PRIMARY KEY,
-                chat_id BIGINT NOT NULL,
-                drinks_used INTEGER DEFAULT 0,
-                date_reset DATE DEFAULT CURRENT_DATE,
-                created_at TIMESTAMPTZ DEFAULT NOW()
-            )
-        """))
+        # Добавляем недостающие колонки если их нет
+        conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS chat_id BIGINT"))
+        conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS tg_id BIGINT UNIQUE"))
+        conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS age INTEGER"))
+        conn.execute(DDL(f"ALTER TABLE {MESSAGES_TABLE} ADD COLUMN IF NOT EXISTS message_id INTEGER"))
+        conn.execute(DDL(f"ALTER TABLE {MESSAGES_TABLE} ADD COLUMN IF NOT EXISTS reply_to_message_id INTEGER"))
+        conn.execute(DDL(f"ALTER TABLE {MESSAGES_TABLE} ADD COLUMN IF NOT EXISTS sticker_sent BOOLEAN DEFAULT FALSE"))
+        conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS preferences TEXT"))
+        conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS last_preference_ask DATE"))
+        conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS last_holiday_suggest TIMESTAMPTZ"))
     
     logger.info("✅ Database tables created/verified")
 
@@ -202,6 +141,99 @@ def increment_katya_drinks(chat_id: int) -> None:
 def can_katya_drink_free(chat_id: int) -> bool:
     """Проверить, может ли Катя выпить бесплатно (лимит 5 напитков в день)"""
     return get_katya_drinks_count(chat_id) < 5
+
+# -----------------------------
+# Система праздников
+# -----------------------------
+def get_today_holidays() -> list[str]:
+    """Получить праздники на сегодня"""
+    today = datetime.now()
+    month_day = (today.month, today.day)
+    
+    # Реальные российские праздники с точными датами
+    holidays = {
+        (1, 1): "Новый год",
+        (1, 7): "Рождество Христово", 
+        (1, 14): "Старый Новый год",
+        (1, 25): "День студента (Татьянин день)",
+        (2, 14): "День святого Валентина",
+        (2, 23): "День защитника Отечества",
+        (3, 8): "Международный женский день",
+        (3, 20): "День весеннего равноденствия",
+        (4, 1): "День смеха",
+        (4, 12): "День космонавтики",
+        (4, 22): "День Земли",
+        (5, 1): "День труда",
+        (5, 9): "День Победы",
+        (5, 15): "День семьи",
+        (5, 24): "День славянской письменности",
+        (6, 1): "День защиты детей",
+        (6, 12): "День России",
+        (6, 22): "День памяти и скорби",
+        (7, 8): "День семьи, любви и верности",
+        (7, 28): "День Крещения Руси",
+        (8, 2): "День ВДВ",
+        (8, 9): "День строителя",
+        (8, 12): "День Военно-воздушных сил",
+        (8, 22): "День Государственного флага",
+        (8, 27): "День кино",
+        (9, 1): "День знаний",
+        (9, 5): "День учителя",
+        (9, 21): "День мира",
+        (9, 27): "День воспитателя",
+        (10, 1): "День пожилых людей",
+        (10, 5): "День учителя (всемирный)",
+        (10, 14): "День стандартизации",
+        (10, 25): "День таможенника",
+        (10, 30): "День памяти жертв политических репрессий",
+        (11, 4): "День народного единства",
+        (11, 7): "День Октябрьской революции",
+        (11, 10): "День милиции",
+        (11, 17): "День участкового",
+        (11, 21): "День бухгалтера",
+        (11, 27): "День матери",
+        (12, 3): "День юриста",
+        (12, 10): "День прав человека",
+        (12, 12): "День Конституции",
+        (12, 20): "День работника органов безопасности",
+        (12, 22): "День энергетика",
+        (12, 25): "Рождество",
+        (12, 31): "Новогодняя ночь"
+    }
+    
+    today_holidays = []
+    if month_day in holidays:
+        today_holidays.append(holidays[month_day])
+    
+    return today_holidays
+
+def should_suggest_holiday(user_tg_id: int) -> bool:
+    """Проверить, можно ли предложить праздник (не чаще раза в сутки)"""
+    with engine.begin() as conn:
+        row = conn.execute(
+            text(f"SELECT last_holiday_suggest FROM {USERS_TABLE} WHERE {U['user_tg_id']} = :tg_id"),
+            {"tg_id": user_tg_id},
+        ).fetchone()
+        
+        if not row or not row[0]:
+            return True
+        
+        last_suggest = row[0]
+        today = datetime.now().date()
+        
+        return last_suggest.date() < today
+
+def update_last_holiday_suggest(user_tg_id: int) -> None:
+    """Обновить дату последнего предложения праздника"""
+    with engine.begin() as conn:
+        conn.execute(
+            text(f"""
+                UPDATE {USERS_TABLE}
+                SET last_holiday_suggest = NOW()
+                WHERE {U['user_tg_id']} = :tg_id
+            """),
+            {"tg_id": user_tg_id}
+        )
 
 # -----------------------------
 # Telegram Application
@@ -434,6 +466,39 @@ def get_user_name(user_tg_id: int) -> Optional[str]:
         ).fetchone()
         return row[0] if row and row[0] else None
 
+def detect_game_context(recent_messages: list) -> Optional[str]:
+    """Определить активную игру по последним сообщениям"""
+    if not recent_messages:
+        return None
+    
+    # Ищем упоминания игр в последних сообщениях
+    game_keywords = {
+        "20 вопросов": ["20 вопросов", "двадцать вопросов", "играем в 20", "загадала слово", "загадал слово"],
+        "правда или действие": ["правда или действие", "правда или ложь", "действие"],
+        "угадай число": ["угадай число", "загадал число", "число от 1 до"],
+        "виселица": ["виселица", "hangman", "угадай слово"]
+    }
+    
+    # Проверяем последние 5 сообщений
+    for msg in recent_messages[-5:]:
+        if msg["role"] == "user":
+            text_lower = msg["content"].lower()
+            for game_name, keywords in game_keywords.items():
+                if any(keyword in text_lower for keyword in keywords):
+                    return game_name
+    
+    return None
+
+def get_game_context_prompt(game_name: str) -> str:
+    """Получить промпт для конкретной игры"""
+    game_prompts = {
+        "20 вопросов": "СЕЙЧАС ИДЕТ ИГРА '20 ВОПРОСОВ'! Ты загадала слово, и пользователь задает вопросы чтобы угадать. Отвечай ТОЛЬКО 'да' или 'нет' на вопросы о свойствах загаданного слова. НЕ отвлекайся на другие темы!",
+        "правда или действие": "СЕЙЧАС ИДЕТ ИГРА 'ПРАВДА ИЛИ ДЕЙСТВИЕ'! Предлагай вопросы или действия для пользователя.",
+        "угадай число": "СЕЙЧАС ИДЕТ ИГРА 'УГАДАЙ ЧИСЛО'! Ты загадала число, пользователь пытается угадать.",
+        "виселица": "СЕЙЧАС ИДЕТ ИГРА 'ВИСЕЛИЦА'! Ты загадала слово, пользователь угадывает буквы."
+    }
+    return game_prompts.get(game_name, "")
+
 async def llm_reply(user_text: str, username: Optional[str], user_tg_id: int, chat_id: int) -> tuple[str, Optional[str]]:
     """
     Генерирует ответ LLM и возвращает (ответ, команда_стикера_или_None)
@@ -478,6 +543,21 @@ async def llm_reply(user_text: str, username: Optional[str], user_tg_id: int, ch
             logger.info(f"Added preference question prompt to LLM")
             # Обновляем дату последнего вопроса
             update_last_preference_ask(user_tg_id)
+        
+        # Проверяем игровой контекст
+        active_game = detect_game_context(recent_messages)
+        if active_game:
+            game_prompt = get_game_context_prompt(active_game)
+            messages.append({"role": "system", "content": game_prompt})
+            logger.info(f"Added game context: {active_game}")
+        
+        # Проверяем праздники
+        today_holidays = get_today_holidays()
+        if today_holidays and should_suggest_holiday(user_tg_id):
+            holiday_text = ", ".join(today_holidays)
+            messages.append({"role": "system", "content": f"СЕГОДНЯ ПРАЗДНИК: {holiday_text}! Можешь предложить выпить в честь этого праздника, но только один раз сегодня."})
+            logger.info(f"Added holiday context: {holiday_text}")
+            update_last_holiday_suggest(user_tg_id)
         
         # Добавляем историю сообщений (только ответы Кати для контекста)
         for msg in reversed(recent_messages[-3:]):  # только последние 3 сообщения
