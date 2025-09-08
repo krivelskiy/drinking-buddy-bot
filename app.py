@@ -1070,62 +1070,88 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # -----------------------------
 @safe_execute
 async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик сообщений с защитой"""
+    """Обработчик сообщений"""
     if not update.message or not update.message.text:
         return
-
+    
     text_in = update.message.text
-    chat_id = update.message.chat_id
     user_tg_id = update.message.from_user.id
-    username = update.message.from_user.username
-    first_name = update.message.from_user.first_name
-    message_id = update.message.message_id
-
-    logger.info("Received message: %s from user %s", text_in, user_tg_id)
-
-    # Rate limiting
-    if not check_rate_limit(user_tg_id):
-        await update.message.reply_text("Слишком много сообщений! Подожди минуту 😅")
-        return
+    chat_id = update.message.chat_id
     
-    # Валидация
-    if not validate_user_input(text_in):
-        await update.message.reply_text("Извини, не могу обработать это сообщение 😅")
-        return
+    logger.info(f"Received message: {text_in} from user {user_tg_id}")
     
-    if not validate_user_id(user_tg_id) or not validate_chat_id(chat_id):
-        logger.warning(f"Invalid IDs: user={user_tg_id}, chat={chat_id}")
-        return
-
-    # 1) Обновляем/создаем пользователя
-    try:
-        upsert_user_from_update(update)
-    except Exception:
-        logger.exception("Failed to upsert user")
-
-    # 2) Сохраняем сообщение пользователя
-    try:
-        save_message(chat_id, user_tg_id, "user", text_in, message_id)
-    except Exception:
-        logger.exception("Failed to save user message")
-
-    # 3) Проверяем на упоминание возраста
+    # ВАЖНО: Проверяем статистику ПЕРВОЙ!
+    if any(word in text_in.lower() for word in ['статистика', 'сколько выпил', 'сколько пил', 'статистик']):
+        stats = generate_drinks_stats(user_tg_id)
+        await update.message.reply_text(f"📊 **Твоя статистика выпитого:**\n\n{stats}")
+        save_message(chat_id, user_tg_id, "assistant", f"📊 **Твоя статистика выпитого:**\n\n{stats}", None, None, None)
+        return  # ВАЖНО: return чтобы НЕ вызывать LLM
+    
+    # Остальные проверки...
+    # 1) Проверяем на упоминание возраста
     age = parse_age_from_text(text_in)
     if age:
         try:
             update_user_age(user_tg_id, age)
             logger.info("Updated user age to %d", age)
         except Exception:
-            logger.exception("Failed to update user age")
-
-    # 3.5) Проверяем на упоминание предпочтений напитков
+            logger.exception("Failed to update age")
+    
+    # 2) Проверяем на упоминание предпочтений в напитках
     preferences = parse_drink_preferences(text_in)
     if preferences:
         try:
             update_user_preferences(user_tg_id, preferences)
             logger.info("Updated user preferences to %s", preferences)
         except Exception:
-            logger.exception("Failed to update user preferences")
+            logger.exception("Failed to update preferences")
+    
+    # 3) Проверяем на упоминание выпитого
+    drink_info = parse_drink_info(text_in)
+    if drink_info:
+        try:
+            save_drink_record(user_tg_id, chat_id, drink_info)
+            logger.info("✅ Saved drink record: %s", drink_info)
+            
+            # Проверяем дневной лимит
+            is_over_limit, total_amount = check_daily_limit(user_tg_id)
+            if is_over_limit:
+                # Получаем имя пользователя для персонализированного сообщения
+                user_name = get_user_name(user_tg_id) or "друг"
+                
+                # Используем LLM для генерации предупреждения
+                warning_prompt = f"""Ты — Катя Собутыльница. Пользователь {user_name} уже выпил {total_amount} порций сегодня. 
+Нужно мягко предупредить его о том, что это много, и предложить сделать перерыв. 
+Отвечай коротко и дружелюбно, как живой человек."""
+
+                try:
+                    response = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[{"role": "user", "content": warning_prompt}],
+                        max_tokens=100,
+                        temperature=0.7
+                    )
+                    warning_msg = response.choices[0].message.content.strip()
+                except Exception:
+                    # Fallback если LLM недоступен
+                    warning_msg = f"⚠️ {user_name}, ты уже выпил {total_amount} порций сегодня! Может, сделаем перерыв? 🍻"
+                
+                await update.message.reply_text(warning_msg)
+                save_message(chat_id, user_tg_id, "assistant", warning_msg, None, None, None)
+                return
+            
+        except Exception:
+            logger.exception("Failed to save drink record")
+    
+    # 4) Проверяем, нужно ли напомнить о статистике
+    if should_remind_about_stats(user_tg_id):
+        reminder_msg = "💡 Кстати, я могу вести статистику твоего выпитого! Просто напиши 'статистика' и я покажу сколько ты выпил сегодня и за неделю! 📊"
+        await update.message.reply_text(reminder_msg)
+        save_message(chat_id, user_tg_id, "assistant", reminder_msg, None, None, None)
+        update_stats_reminder(user_tg_id)
+        return
+    
+    # Остальная логика...
 
     # 4) Проверяем на упоминание количества выпитого
     drink_amount = parse_drink_amount(text_in)
@@ -1136,14 +1162,14 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except Exception:
             logger.exception("Failed to update drink count")
 
-    # 4) Генерируем ответ через OpenAI
-    answer, sticker_command = await llm_reply(text_in, username, user_tg_id, chat_id)
+    # 5) Генерируем ответ через OpenAI
+    answer, sticker_command = await llm_reply(text_in, None, user_tg_id, chat_id)
 
-    # 5) Отправляем ответ
+    # 6) Отправляем ответ
     try:
         sent_message = await update.message.reply_text(answer)
         
-        # 6) Проверяем, можем ли отправить стикер (если LLM его определил)
+        # 7) Проверяем, можем ли отправить стикер (если LLM его определил)
         if sticker_command:
             # Проверяем, может ли Катя пить бесплатно
             if can_katya_drink_free(chat_id):
@@ -1168,39 +1194,6 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.message.reply_text("Произошла ошибка. Попробуй еще раз! 🤔")
         except Exception:
             pass  # Не падаем из-за ошибки в ответе
-
-    # В msg_handler добавляю после парсинга возраста:
-    # 4) Проверяем на упоминание выпитого
-    drink_info = parse_drink_info(text_in)
-    if drink_info:
-        try:
-            save_drink_record(user_tg_id, chat_id, drink_info)
-            logger.info("Saved drink record: %s", drink_info)
-            
-            # Проверяем дневной лимит
-            is_over_limit, total_amount = check_daily_limit(user_tg_id)
-            if is_over_limit:
-                warning_msg = f"⚠️ Миша, ты уже выпил {total_amount} порций сегодня! Может, сделаем перерыв? 🍻"
-                await update.message.reply_text(warning_msg)
-                save_message(chat_id, user_tg_id, "assistant", warning_msg, None, None, None)
-                return
-            
-        except Exception:
-            logger.exception("Failed to save drink record")
-
-    # 5) Проверяем запрос статистики
-    if any(word in text_in.lower() for word in ['статистика', 'сколько выпил', 'сколько пил', 'статистик']):
-        stats = generate_drinks_stats(user_tg_id)
-        await update.message.reply_text(f"📊 **Твоя статистика выпитого:**\n\n{stats}")
-        save_message(chat_id, user_tg_id, "assistant", stats, None, None, None)
-        return
-
-    # 6) Проверяем, нужно ли напомнить о статистике
-    if should_remind_about_stats(user_tg_id):
-        reminder_msg = "💡 Кстати, я могу вести статистику твоего выпитого! Просто напиши 'статистика' и я покажу сколько ты выпил сегодня и за неделю! 📊"
-        await update.message.reply_text(reminder_msg)
-        save_message(chat_id, user_tg_id, "assistant", reminder_msg, None, None, None)
-        update_stats_reminder(user_tg_id)
 
 def get_alcohol_sticker_count(user_tg_id: int) -> int:
     """Получение количества стикеров алкоголя для пользователя"""
@@ -1742,9 +1735,9 @@ def parse_drink_info(text: str) -> Optional[dict]:
         
         # ВАЖНО: Специфичные паттерны ДОЛЖНЫ быть ПЕРВЫМИ!
         patterns = [
-            # Пиво - специфичные паттерны
-            (r'выпил\s+(\d+|[а-я]+)\s*(?:стакан|бокал|банк|бутылк|л|мл)?\s*(?:пива|пивка)', 'пиво', 'стакан'),
-            (r'(\d+|[а-я]+)\s*(?:стакан|бокал|банк|бутылк|л|мл)?\s*(?:пива|пивка)', 'пиво', 'стакан'),
+            # Пиво - специфичные паттерны (включая барнаульское)
+            (r'выпил\s+(\d+|[а-я]+)\s*(?:стакан|бокал|банк|бутылк|л|мл)?\s*(?:пива|пивка|барнаульского)', 'пиво', 'стакан'),
+            (r'(\d+|[а-я]+)\s*(?:стакан|бокал|банк|бутылк|л|мл)?\s*(?:пива|пивка|барнаульского)', 'пиво', 'стакан'),
             
             # Вино - специфичные паттерны
             (r'выпил\s+(\d+|[а-я]+)\s*(?:бокал|стакан|л|мл)?\s*(?:вина|винца)', 'вино', 'бокал'),
@@ -1778,7 +1771,7 @@ def parse_drink_info(text: str) -> Optional[dict]:
                     continue
                 
                 if 1 <= amount <= 50:  # Разумные пределы
-                    logger.info(f"Parsed drink: {amount} {unit} of {drink_type}")
+                    logger.info(f"✅ Parsed drink: {amount} {unit} of {drink_type}")
                     return {
                         'drink_type': drink_type,
                         'amount': amount,
@@ -1786,7 +1779,7 @@ def parse_drink_info(text: str) -> Optional[dict]:
                     }
         return None
     except Exception as e:
-        logger.error(f"Error parsing drink info: {e}")
+        logger.error(f"❌ Error parsing drink info: {e}")
         return None
 
 def save_drink_record(user_tg_id: int, chat_id: int, drink_info: dict) -> None:
@@ -1866,7 +1859,8 @@ def generate_drinks_stats(user_tg_id: int) -> str:
         daily_drinks = get_daily_drinks(user_tg_id)
         weekly_drinks = get_weekly_drinks(user_tg_id)
         
-        logger.info(f"Stats for user {user_tg_id}: daily={len(daily_drinks)}, weekly={len(weekly_drinks)}")
+        logger.info(f"📊 Stats for user {user_tg_id}: daily={len(daily_drinks)}, weekly={len(weekly_drinks)}")
+        logger.info(f"📊 Daily drinks data: {daily_drinks}")
         
         if not daily_drinks and not weekly_drinks:
             return "Ты еще ничего не пил сегодня или на этой неделе! 🍻"
@@ -1894,9 +1888,11 @@ def generate_drinks_stats(user_tg_id: int) -> str:
             weekly_total = sum(drink['amount'] for drink in weekly_drinks)
             stats.append(f"📊 **За неделю:** {weekly_total} порций")
         
-        return "\n".join(stats)
+        result = "\n".join(stats)
+        logger.info(f"📊 Generated stats: {result}")
+        return result
     except Exception as e:
-        logger.error(f"Error generating drinks stats: {e}")
+        logger.error(f"❌ Error generating drinks stats: {e}")
         return "Не могу получить статистику сейчас 😅"
 
 def check_daily_limit(user_tg_id: int) -> tuple[bool, int]:
