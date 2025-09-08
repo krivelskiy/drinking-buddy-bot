@@ -154,6 +154,13 @@ def init_db():
                 first_name TEXT,
                 last_name TEXT,
                 age INTEGER,
+                preferences TEXT,
+                last_preference_ask DATE,
+                last_holiday_suggest TIMESTAMPTZ,
+                last_auto_message TIMESTAMPTZ,
+                drink_count INTEGER DEFAULT 0,
+                last_drink_report DATE,
+                last_stats_reminder TIMESTAMPTZ,
                 created_at TIMESTAMPTZ DEFAULT NOW()
             )
         """))
@@ -168,21 +175,51 @@ def init_db():
                 content TEXT NOT NULL,
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 reply_to_message_id INTEGER,
-                message_id INTEGER
+                message_id INTEGER,
+                sticker_sent TEXT
             )
         """))
         
-        # Добавляем недостающие колонки если их нет
+        # НОВАЯ ТАБЛИЦА: Детальное отслеживание выпитого
+        conn.execute(DDL(f"""
+            CREATE TABLE IF NOT EXISTS user_drinks (
+                id SERIAL PRIMARY KEY,
+                user_tg_id BIGINT NOT NULL,
+                chat_id BIGINT NOT NULL,
+                drink_type TEXT NOT NULL,
+                amount INTEGER NOT NULL,
+                unit TEXT NOT NULL,
+                drink_time TIMESTAMPTZ DEFAULT NOW(),
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """))
+        
+        # Добавляем колонки если их нет (для совместимости с существующими БД)
         conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS chat_id BIGINT"))
-        conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS tg_id BIGINT UNIQUE"))
+        conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS user_tg_id BIGINT"))
         conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS age INTEGER"))
-        conn.execute(DDL(f"ALTER TABLE {MESSAGES_TABLE} ADD COLUMN IF NOT EXISTS message_id INTEGER"))
-        conn.execute(DDL(f"ALTER TABLE {MESSAGES_TABLE} ADD COLUMN IF NOT EXISTS reply_to_message_id INTEGER"))
-        conn.execute(DDL(f"ALTER TABLE {MESSAGES_TABLE} ADD COLUMN IF NOT EXISTS sticker_sent BOOLEAN DEFAULT FALSE"))
         conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS preferences TEXT"))
         conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS last_preference_ask DATE"))
         conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS last_holiday_suggest TIMESTAMPTZ"))
         conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS last_auto_message TIMESTAMPTZ"))
+        conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS drink_count INTEGER DEFAULT 0"))
+        conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS last_drink_report DATE"))
+        conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS last_stats_reminder TIMESTAMPTZ"))
+        
+        conn.execute(DDL(f"ALTER TABLE {MESSAGES_TABLE} ADD COLUMN IF NOT EXISTS message_id INTEGER"))
+        conn.execute(DDL(f"ALTER TABLE {MESSAGES_TABLE} ADD COLUMN IF NOT EXISTS reply_to_message_id INTEGER"))
+        conn.execute(DDL(f"ALTER TABLE {MESSAGES_TABLE} ADD COLUMN IF NOT EXISTS sticker_sent TEXT"))
+        
+        # Создание таблицы для бесплатных напитков Кати
+        conn.execute(DDL(f"""
+            CREATE TABLE IF NOT EXISTS katya_free_drinks (
+                id SERIAL PRIMARY KEY,
+                chat_id BIGINT NOT NULL,
+                drinks_used INTEGER DEFAULT 0,
+                date_reset DATE DEFAULT CURRENT_DATE,
+                UNIQUE(chat_id, date_reset)
+            )
+        """))
     
     logger.info("✅ Database tables created/verified")
 
@@ -609,7 +646,20 @@ def parse_age_from_text(text: str) -> Optional[int]:
     """Заглушка для парсинга возраста"""
     try:
         # Реальная логика парсинга
-        return age
+        patterns = [
+            r'мне\s+(\d+)\s+лет',
+            r'мне\s+(\d+)',
+            r'(\d+)\s+лет',
+        ]
+        
+        text_lower = text.lower()
+        for pattern in patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                age = int(match.group(1))
+                if 1 <= age <= 120:
+                    return age
+        return None
     except Exception as e:
         logger.error(f"Error parsing age: {e}")
         return None
@@ -630,7 +680,7 @@ def get_recent_messages(chat_id: int, limit: int = 12) -> list:
         return [{"role": row[0], "content": row[1]} for row in rows]
 
 def get_user_facts(user_tg_id: int) -> str:
-    """Получить важные факты о пользователе для контекста"""
+    """Получение важных фактов о пользователе"""
     facts = []
     
     # Возраст
@@ -648,12 +698,18 @@ def get_user_facts(user_tg_id: int) -> str:
     if name:
         facts.append(f"Имя: {name}")
     
+    # Статистика выпитого за день
+    daily_drinks = get_daily_drinks(user_tg_id)
+    if daily_drinks:
+        daily_total = sum(drink['amount'] for drink in daily_drinks)
+        facts.append(f"Выпито сегодня: {daily_total} порций")
+    
     return ", ".join(facts) if facts else ""
 
 def build_conversation_context(recent_messages: list, user_text: str) -> list:
     """Построить контекст разговора с умным сжатием"""
-    # Берем последние 8 сообщений (4 пары вопрос-ответ)
-    context_messages = recent_messages[-8:] if len(recent_messages) > 8 else recent_messages
+    # Берем последние 12 сообщений (6 пар вопрос-ответ) - увеличиваем лимит
+    context_messages = recent_messages[-12:] if len(recent_messages) > 12 else recent_messages
     
     # Разворачиваем в хронологическом порядке
     context_messages.reverse()
@@ -661,8 +717,8 @@ def build_conversation_context(recent_messages: list, user_text: str) -> list:
     # Фильтруем только релевантные сообщения
     filtered_messages = []
     for msg in context_messages:
-        # Пропускаем очень короткие сообщения
-        if len(msg["content"].strip()) < 3:
+        # Пропускаем очень короткие сообщения (уменьшаем лимит)
+        if len(msg["content"].strip()) < 2:
             continue
         filtered_messages.append(msg)
     
@@ -1071,6 +1127,15 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except Exception:
             logger.exception("Failed to update user preferences")
 
+    # 4) Проверяем на упоминание количества выпитого
+    drink_amount = parse_drink_amount(text_in)
+    if drink_amount:
+        try:
+            update_user_drink_count(user_tg_id, drink_amount)
+            logger.info("Updated user drink count by %d", drink_amount)
+        except Exception:
+            logger.exception("Failed to update drink count")
+
     # 4) Генерируем ответ через OpenAI
     answer, sticker_command = await llm_reply(text_in, username, user_tg_id, chat_id)
 
@@ -1083,7 +1148,7 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             # Проверяем, может ли Катя пить бесплатно
             if can_katya_drink_free(chat_id):
                 # Отправляем стикер и увеличиваем счетчик
-                await send_sticker_by_command(sticker_command, chat_id)
+                await send_sticker_by_command(chat_id, sticker_command)  # Исправлено: правильный порядок
                 increment_katya_drinks(chat_id)
                 
                 # Сохраняем ответ бота С информацией о стикере
@@ -1103,6 +1168,39 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.message.reply_text("Произошла ошибка. Попробуй еще раз! 🤔")
         except Exception:
             pass  # Не падаем из-за ошибки в ответе
+
+    # В msg_handler добавляю после парсинга возраста:
+    # 4) Проверяем на упоминание выпитого
+    drink_info = parse_drink_info(text_in)
+    if drink_info:
+        try:
+            save_drink_record(user_tg_id, chat_id, drink_info)
+            logger.info("Saved drink record: %s", drink_info)
+            
+            # Проверяем дневной лимит
+            is_over_limit, total_amount = check_daily_limit(user_tg_id)
+            if is_over_limit:
+                warning_msg = f"⚠️ Миша, ты уже выпил {total_amount} порций сегодня! Может, сделаем перерыв? 🍻"
+                await update.message.reply_text(warning_msg)
+                save_message(chat_id, user_tg_id, "assistant", warning_msg, None, None, None)
+                return
+            
+        except Exception:
+            logger.exception("Failed to save drink record")
+
+    # 5) Проверяем запрос статистики
+    if any(word in text_in.lower() for word in ['статистика', 'сколько выпил', 'сколько пил', 'статистик']):
+        stats = generate_drinks_stats(user_tg_id)
+        await update.message.reply_text(f"📊 **Твоя статистика выпитого:**\n\n{stats}")
+        save_message(chat_id, user_tg_id, "assistant", stats, None, None, None)
+        return
+
+    # 6) Проверяем, нужно ли напомнить о статистике
+    if should_remind_about_stats(user_tg_id):
+        reminder_msg = "💡 Кстати, я могу вести статистику твоего выпитого! Просто напиши 'статистика' и я покажу сколько ты выпил сегодня и за неделю! 📊"
+        await update.message.reply_text(reminder_msg)
+        save_message(chat_id, user_tg_id, "assistant", reminder_msg, None, None, None)
+        update_stats_reminder(user_tg_id)
 
 def get_alcohol_sticker_count(user_tg_id: int) -> int:
     """Получение количества стикеров алкоголя для пользователя"""
@@ -1282,6 +1380,66 @@ def parse_drink_preferences(text: str) -> Optional[str]:
             return ", ".join(found_drinks)
     
     return None
+
+def parse_drink_amount(text: str) -> Optional[int]:
+    """Парсинг количества выпитого из текста"""
+    try:
+        # Паттерны для поиска количества
+        patterns = [
+            r'выпил\s+(\d+)\s+бокал',
+            r'выпил\s+(\d+)\s+стакан',
+            r'выпил\s+(\d+)\s+рюмк',
+            r'(\d+)\s+бокал',
+            r'(\d+)\s+стакан',
+            r'(\d+)\s+рюмк',
+        ]
+        
+        text_lower = text.lower()
+        for pattern in patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                amount = int(match.group(1))
+                if 1 <= amount <= 50:  # Разумные пределы
+                    logger.info(f"Parsed drink amount: {amount}")
+                    return amount
+        return None
+    except Exception as e:
+        logger.error(f"Error parsing drink amount: {e}")
+        return None
+
+def update_user_drink_count(user_tg_id: int, amount: int) -> None:
+    """Обновление счетчика выпитого пользователя"""
+    try:
+        # Получаем текущий счетчик
+        current_count = get_user_drink_count(user_tg_id)
+        new_count = current_count + amount
+        
+        # Обновляем в БД (добавляем поле drink_count в users таблицу)
+        with engine.begin() as conn:
+            conn.execute(
+                text(f"""
+                    UPDATE {USERS_TABLE}
+                    SET drink_count = :count
+                    WHERE {U['user_tg_id']} = :tg_id
+                """),
+                {"tg_id": user_tg_id, "count": new_count},
+            )
+        logger.info(f"Updated drink count for user {user_tg_id}: {current_count} + {amount} = {new_count}")
+    except Exception as e:
+        logger.error(f"Error updating drink count: {e}")
+
+def get_user_drink_count(user_tg_id: int) -> int:
+    """Получение счетчика выпитого пользователя"""
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(
+                text(f"SELECT drink_count FROM {USERS_TABLE} WHERE {U['user_tg_id']} = :tg_id"),
+                {"tg_id": user_tg_id},
+            ).fetchone()
+            return row[0] if row and row[0] else 0
+    except Exception as e:
+        logger.error(f"Error getting drink count: {e}")
+        return 0
 
 # -----------------------------
 # FastAPI приложение
@@ -1565,3 +1723,222 @@ def safe_should_ask_preferences(user_tg_id: int) -> bool:
     except Exception as e:
         logger.error(f"Error checking preferences: {e}")
         return False
+
+# -----------------------------
+# Функции для детального отслеживания выпитого
+# -----------------------------
+
+def parse_drink_info(text: str) -> Optional[dict]:
+    """Парсинг информации о выпитом из текста"""
+    try:
+        # Паттерны для разных напитков и единиц измерения
+        patterns = [
+            # Пиво
+            (r'выпил\s+(\d+)\s*(?:стакан|бокал|банк|бутылк|л|мл)?\s*(?:пива|пивка)', 'пиво', 'стакан'),
+            (r'(\d+)\s*(?:стакан|бокал|банк|бутылк|л|мл)?\s*(?:пива|пивка)', 'пиво', 'стакан'),
+            
+            # Вино
+            (r'выпил\s+(\d+)\s*(?:бокал|стакан|л|мл)?\s*(?:вина|винца)', 'вино', 'бокал'),
+            (r'(\d+)\s*(?:бокал|стакан|л|мл)?\s*(?:вина|винца)', 'вино', 'бокал'),
+            
+            # Водка
+            (r'выпил\s+(\d+)\s*(?:рюмк|стакан|л|мл)?\s*(?:водки|водочки)', 'водка', 'рюмка'),
+            (r'(\d+)\s*(?:рюмк|стакан|л|мл)?\s*(?:водки|водочки)', 'водка', 'рюмка'),
+            
+            (r'выпил\s+(\d+)\s*(?:рюмк|стакан|л|мл)?\s*(?:виски|вискаря)', 'виски', 'рюмка'),
+            (r'(\d+)\s*(?:рюмк|стакан|л|мл)?\s*(?:виски|вискаря)', 'виски', 'рюмка'),
+            
+            # Общие паттерны
+            (r'выпил\s+(\d+)\s*(?:стакан|бокал|рюмк|л|мл)', 'напиток', 'порция'),
+            (r'(\d+)\s*(?:стакан|бокал|рюмк|л|мл)', 'напиток', 'порция'),
+        ]
+        
+        text_lower = text.lower()
+        for pattern, drink_type, unit in patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                amount = int(match.group(1))
+                if 1 <= amount <= 50:  # Разумные пределы
+                    logger.info(f"Parsed drink: {amount} {unit} of {drink_type}")
+                    return {
+                        'drink_type': drink_type,
+                        'amount': amount,
+                        'unit': unit
+                    }
+        return None
+    except Exception as e:
+        logger.error(f"Error parsing drink info: {e}")
+        return None
+
+def save_drink_record(user_tg_id: int, chat_id: int, drink_info: dict) -> None:
+    """Сохранение записи о выпитом"""
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO user_drinks (user_tg_id, chat_id, drink_type, amount, unit)
+                    VALUES (:tg_id, :chat_id, :drink_type, :amount, :unit)
+                """),
+                {
+                    "tg_id": user_tg_id,
+                    "chat_id": chat_id,
+                    "drink_type": drink_info['drink_type'],
+                    "amount": drink_info['amount'],
+                    "unit": drink_info['unit']
+                },
+            )
+        
+        # Обновляем дату последнего отчета
+        with engine.begin() as conn:
+            conn.execute(
+                text(f"""
+                    UPDATE {USERS_TABLE}
+                    SET last_drink_report = CURRENT_DATE
+                    WHERE {U['user_tg_id']} = :tg_id
+                """),
+                {"tg_id": user_tg_id},
+            )
+        
+        logger.info(f"Saved drink record: {drink_info}")
+    except Exception as e:
+        logger.error(f"Error saving drink record: {e}")
+
+def get_daily_drinks(user_tg_id: int) -> list:
+    """Получение выпитого за сегодня"""
+    try:
+        with engine.begin() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT drink_type, amount, unit, drink_time
+                    FROM user_drinks
+                    WHERE user_tg_id = :tg_id
+                    AND DATE(drink_time) = CURRENT_DATE
+                    ORDER BY drink_time DESC
+                """),
+                {"tg_id": user_tg_id},
+            ).fetchall()
+            return [dict(row._mapping) for row in rows]
+    except Exception as e:
+        logger.error(f"Error getting daily drinks: {e}")
+        return []
+
+def get_weekly_drinks(user_tg_id: int) -> list:
+    """Получение выпитого за неделю"""
+    try:
+        with engine.begin() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT drink_type, amount, unit, drink_time
+                    FROM user_drinks
+                    WHERE user_tg_id = :tg_id
+                    AND drink_time >= CURRENT_DATE - INTERVAL '7 days'
+                    ORDER BY drink_time DESC
+                """),
+                {"tg_id": user_tg_id},
+            ).fetchall()
+            return [dict(row._mapping) for row in rows]
+    except Exception as e:
+        logger.error(f"Error getting weekly drinks: {e}")
+        return []
+
+def generate_drinks_stats(user_tg_id: int) -> str:
+    """Генерация статистики выпитого"""
+    try:
+        daily_drinks = get_daily_drinks(user_tg_id)
+        weekly_drinks = get_weekly_drinks(user_tg_id)
+        
+        if not daily_drinks and not weekly_drinks:
+            return "Ты еще ничего не пил сегодня или на этой неделе! 🍻"
+        
+        stats = []
+        
+        # Статистика за день
+        if daily_drinks:
+            daily_total = sum(drink['amount'] for drink in daily_drinks)
+            stats.append(f"📅 **Сегодня:** {daily_total} порций")
+            
+            # Группировка по типам напитков
+            drink_types = {}
+            for drink in daily_drinks:
+                drink_type = drink['drink_type']
+                if drink_type not in drink_types:
+                    drink_types[drink_type] = 0
+                drink_types[drink_type] += drink['amount']
+            
+            for drink_type, amount in drink_types.items():
+                stats.append(f"  • {drink_type}: {amount} порций")
+        
+        # Статистика за неделю
+        if weekly_drinks:
+            weekly_total = sum(drink['amount'] for drink in weekly_drinks)
+            stats.append(f"📊 **За неделю:** {weekly_total} порций")
+        
+        return "\n".join(stats)
+    except Exception as e:
+        logger.error(f"Error generating drinks stats: {e}")
+        return "Не могу получить статистику сейчас 😅"
+
+def check_daily_limit(user_tg_id: int) -> tuple[bool, int]:
+    """Проверка дневного лимита выпитого"""
+    try:
+        daily_drinks = get_daily_drinks(user_tg_id)
+        total_amount = sum(drink['amount'] for drink in daily_drinks)
+        
+        # Лимит: 10 порций в день
+        DAILY_LIMIT = 10
+        is_over_limit = total_amount >= DAILY_LIMIT
+        
+        return is_over_limit, total_amount
+    except Exception as e:
+        logger.error(f"Error checking daily limit: {e}")
+        return False, 0
+
+def should_remind_about_stats(user_tg_id: int) -> bool:
+    """Проверка, нужно ли напомнить о статистике"""
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(
+                text(f"""
+                    SELECT last_stats_reminder, last_drink_report
+                    FROM {USERS_TABLE}
+                    WHERE {U['user_tg_id']} = :tg_id
+                """),
+                {"tg_id": user_tg_id},
+            ).fetchone()
+            
+            if not row:
+                return True
+            
+            last_reminder = row[0]
+            last_report = row[1]
+            
+            # Напоминаем если:
+            # 1. Никогда не напоминали
+            # 2. Прошло больше суток с последнего напоминания
+            # 3. Пользователь не отправлял отчет сегодня
+            if not last_reminder:
+                return True
+            
+            if last_reminder and (datetime.now() - last_reminder).days >= 1:
+                if not last_report or last_report < datetime.now().date():
+                    return True
+            
+            return False
+    except Exception as e:
+        logger.error(f"Error checking stats reminder: {e}")
+        return False
+
+def update_stats_reminder(user_tg_id: int) -> None:
+    """Обновление времени последнего напоминания о статистике"""
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(f"""
+                    UPDATE {USERS_TABLE}
+                    SET last_stats_reminder = NOW()
+                    WHERE {U['user_tg_id']} = :tg_id
+                """),
+                {"tg_id": user_tg_id},
+            )
+    except Exception as e:
+        logger.error(f"Error updating stats reminder: {e}")
