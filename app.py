@@ -211,6 +211,7 @@ def init_db():
         conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS drink_count INTEGER DEFAULT 0"))
         conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS last_drink_report DATE"))
         conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS last_stats_reminder TIMESTAMPTZ"))
+        conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS last_quick_message TIMESTAMPTZ"))
         
         conn.execute(DDL(f"ALTER TABLE {MESSAGES_TABLE} ADD COLUMN IF NOT EXISTS message_id INTEGER"))
         conn.execute(DDL(f"ALTER TABLE {MESSAGES_TABLE} ADD COLUMN IF NOT EXISTS reply_to_message_id INTEGER"))
@@ -1537,7 +1538,8 @@ async def on_startup():
     # Запуск планировщиков
     asyncio.create_task(ping_scheduler())
     asyncio.create_task(auto_message_scheduler())
-    logger.info("✅ Auto message scheduler started")
+    asyncio.create_task(quick_message_scheduler())  # Новый планировщик
+    logger.info("✅ Auto message schedulers started")
 
 @app.on_event("shutdown")
 async def on_shutdown():
@@ -2421,3 +2423,116 @@ def get_recent_messages(chat_id: int, limit: int = 20) -> list:
     except Exception as e:
         logger.error(f"Error getting recent messages: {e}")
         return []
+
+# -----------------------------
+# Система быстрых сообщений (15 минут)
+# -----------------------------
+def get_users_for_quick_message() -> list[dict]:
+    """Получить пользователей, которым нужно отправить быстрое сообщение (15 минут)"""
+    with engine.begin() as conn:
+        # Ищем пользователей, с которыми не общались более 15 минут
+        query = f"""
+            SELECT DISTINCT u.user_tg_id, u.chat_id, u.first_name, u.preferences
+            FROM {USERS_TABLE} u
+            LEFT JOIN (
+                SELECT user_tg_id, MAX(created_at) as last_message_time
+                FROM {MESSAGES_TABLE}
+                WHERE role = 'user'
+                GROUP BY user_tg_id
+            ) m ON u.user_tg_id = m.user_tg_id
+            WHERE m.last_message_time IS NOT NULL
+               AND m.last_message_time < NOW() - INTERVAL '15 minutes'
+               AND (u.last_quick_message IS NULL 
+                    OR u.last_quick_message < NOW() - INTERVAL '15 minutes')
+        """
+        
+        rows = conn.execute(text(query)).fetchall()
+        return [
+            {
+                "user_tg_id": row[0],
+                "chat_id": row[1], 
+                "first_name": row[2],
+                "preferences": row[3]
+            }
+            for row in rows
+        ]
+
+def generate_quick_message(first_name: str, preferences: Optional[str]) -> str:
+    """Генерация быстрого сообщения для поддержания диалога"""
+    quick_messages = [
+        f"Эй, {first_name}! Не скучай без меня! ",
+        f"{first_name}, а что если мы продолжим наш разговор? ",
+        f"Привет, {first_name}! Как дела? Не хочешь поболтать? 💬",
+        f"Эй, {first_name}! Я тут одна, не скучно ли тебе? ",
+        f"{first_name}, а давай поговорим о чем-нибудь интересном? ✨",
+        f"Привет! {first_name}, не забыл про меня? 😊",
+        f"Эй, {first_name}! Что-то тихо стало... ",
+        f"{first_name}, а давай выпьем за что-нибудь хорошее? 🥂"
+    ]
+    
+    # Если есть предпочтения, добавляем персонализацию
+    if preferences and "пиво" in preferences.lower():
+        quick_messages.extend([
+            f"Эй, {first_name}! Не хочешь пивка? 🍺",
+            f"{first_name}, а что насчет холодного пива? 🍻"
+        ])
+    elif preferences and "вино" in preferences.lower():
+        quick_messages.extend([
+            f"Эй, {first_name}! Не хочешь бокал вина? 🍷",
+            f"{first_name}, а что насчет красного вина? 🍷"
+        ])
+    
+    return random.choice(quick_messages)
+
+def update_last_quick_message(user_tg_id: int) -> None:
+    """Обновить время последнего быстрого сообщения"""
+    with engine.begin() as conn:
+        conn.execute(
+            text(f"UPDATE {USERS_TABLE} SET last_quick_message = NOW() WHERE user_tg_id = :tg_id"),
+            {"tg_id": user_tg_id}
+        )
+
+async def send_quick_messages():
+    """Отправить быстрые сообщения пользователям"""
+    try:
+        users = get_users_for_quick_message()
+        logger.info(f"Found {len(users)} users for quick messages")
+        
+        for user in users:
+            try:
+                message = generate_quick_message(user["first_name"] or "друг", user["preferences"])
+                
+                # Отправляем сообщение через Telegram API
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(
+                        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                        json={
+                            "chat_id": user["chat_id"],
+                            "text": message
+                        }
+                    )
+                    
+                    if response.status_code == 200:
+                        logger.info(f"Quick message sent to user {user['user_tg_id']}: {message[:50]}...")
+                        update_last_quick_message(user["user_tg_id"])
+                        
+                        # Сохраняем сообщение в БД
+                        save_message(user["chat_id"], user["user_tg_id"], "assistant", message, None)
+                    else:
+                        logger.warning(f"Failed to send quick message to user {user['user_tg_id']}: {response.text}")
+                        
+            except Exception as e:
+                logger.exception(f"Error sending quick message to user {user['user_tg_id']}: {e}")
+                
+    except Exception as e:
+        logger.exception(f"Error in send_quick_messages: {e}")
+
+async def quick_message_scheduler():
+    """Планировщик быстрых сообщений - каждые 5 минут"""
+    while True:
+        try:
+            await send_quick_messages()
+            await asyncio.sleep(5 * 60)  # 5 минут
+        except Exception as e:
+            logger.exception(f"Error in quick_message_scheduler: {e}")
+            await asyncio.sleep(60)  # При ошибке ждем минуту
