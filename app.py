@@ -2464,7 +2464,7 @@ def get_users_for_quick_message() -> list[dict]:
     with engine.begin() as conn:
         # Ищем пользователей, с которыми не общались более 15 минут
         query = f"""
-            SELECT DISTINCT u.user_tg_id, u.chat_id, u.first_name, u.preferences
+            SELECT DISTINCT u.user_tg_id, u.chat_id, u.first_name, u.preferences, u.last_quick_message
             FROM {USERS_TABLE} u
             LEFT JOIN (
                 SELECT user_tg_id, MAX(created_at) as last_message_time
@@ -2479,6 +2479,10 @@ def get_users_for_quick_message() -> list[dict]:
         """
         
         rows = conn.execute(text(query)).fetchall()
+        logger.info(f"Quick message query returned {len(rows)} users")
+        for row in rows:
+            logger.info(f"User {row[0]}: last_quick_message = {row[4]}")
+        
         return [
             {
                 "user_tg_id": row[0],
@@ -2561,11 +2565,16 @@ def generate_quick_message(first_name: str, preferences: Optional[str]) -> str:
 
 def update_last_quick_message(user_tg_id: int) -> None:
     """Обновить время последнего быстрого сообщения"""
-    with engine.begin() as conn:
-        conn.execute(
-            text(f"UPDATE {USERS_TABLE} SET last_quick_message = NOW() WHERE user_tg_id = :tg_id"),
-            {"tg_id": user_tg_id}
-        )
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(
+                text(f"UPDATE {USERS_TABLE} SET last_quick_message = NOW() WHERE user_tg_id = :tg_id"),
+                {"tg_id": user_tg_id}
+            )
+            updated_count = result.rowcount
+            logger.info(f"Updated last_quick_message for user {user_tg_id}, rows affected: {updated_count}")
+    except Exception as e:
+        logger.exception(f"Error updating last_quick_message for user {user_tg_id}: {e}")
 
 async def send_quick_messages():
     """Отправить быстрые сообщения пользователям"""
