@@ -2578,6 +2578,7 @@ def update_last_quick_message(user_tg_id: int) -> None:
 
 async def send_quick_messages():
     """Отправить быстрые сообщения пользователям"""
+    logger.info("🔍 DEBUG: send_quick_messages() вызвана!")
     try:
         users = get_users_for_quick_message()
         logger.info(f"Found {len(users)} users for quick messages")
