@@ -2584,6 +2584,9 @@ async def send_quick_messages():
         
         for user in users:
             try:
+                # СНАЧАЛА обновляем last_quick_message, чтобы избежать повторной отправки
+                update_last_quick_message(user["user_tg_id"])
+                
                 # Используем LLM для генерации уникального сообщения
                 message = generate_quick_message_llm(
                     user["first_name"] or "друг", 
@@ -2603,7 +2606,6 @@ async def send_quick_messages():
                     
                     if response.status_code == 200:
                         logger.info(f"Quick message sent to user {user['user_tg_id']}: {message[:50]}...")
-                        update_last_quick_message(user["user_tg_id"])
                         
                         # Сохраняем сообщение в БД
                         save_message(user["chat_id"], user["user_tg_id"], "assistant", message, None)
