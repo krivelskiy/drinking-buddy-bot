@@ -230,11 +230,37 @@ def init_db():
                 UNIQUE(chat_id, date_reset)
             )
         """))
-        
-        # Инициализируем timestamps быстрых сообщений
-        init_quick_message_timestamps()
+    
+    # Инициализируем timestamps быстрых сообщений ВНЕ транзакции
+    init_quick_message_timestamps()
     
     logger.info("✅ Database tables created/verified")
+
+def init_quick_message_timestamps():
+    """Инициализировать timestamps быстрых сообщений для существующих пользователей"""
+    try:
+        logger.info(" Initializing quick message timestamps...")
+        with engine.begin() as conn:
+            # Устанавливаем last_quick_message = NOW() для пользователей, у которых оно NULL
+            # но которые недавно общались (чтобы не спамить)
+            result = conn.execute(
+                text(f"""
+                    UPDATE {USERS_TABLE} 
+                    SET last_quick_message = NOW() 
+                    WHERE last_quick_message IS NULL
+                      AND user_tg_id IN (
+                          SELECT DISTINCT user_tg_id 
+                          FROM {MESSAGES_TABLE} 
+                          WHERE role = 'user' 
+                            AND created_at > NOW() - INTERVAL '1 hour'
+                      )
+                """)
+            )
+            updated_count = result.rowcount
+            logger.info(f"✅ Quick message timestamps initialized for {updated_count} recent users")
+    except Exception as e:
+        logger.exception(f"Error initializing quick message timestamps: {e}")
+        # Не падаем из-за этой ошибки
 
 # -----------------------------
 # OpenAI клиент
@@ -2590,117 +2616,3 @@ async def quick_message_scheduler():
         except Exception as e:
             logger.exception(f"Error in quick_message_scheduler: {e}")
             await asyncio.sleep(60)  # При ошибке ждем минуту
-
-def init_quick_message_timestamps():
-    """Инициализировать timestamps быстрых сообщений для существующих пользователей"""
-    try:
-        with engine.begin() as conn:
-            # Устанавливаем last_quick_message = NOW() для пользователей, у которых оно NULL
-            # но которые недавно общались (чтобы не спамить)
-            conn.execute(
-                text(f"""
-                    UPDATE {USERS_TABLE} 
-                    SET last_quick_message = NOW() 
-                    WHERE last_quick_message IS NULL
-                      AND user_tg_id IN (
-                          SELECT DISTINCT user_tg_id 
-                          FROM {MESSAGES_TABLE} 
-                          WHERE role = 'user' 
-                            AND created_at > NOW() - INTERVAL '1 hour'
-                      )
-                """)
-            )
-            logger.info("✅ Quick message timestamps initialized for recent users")
-    except Exception as e:
-        logger.exception(f"Error initializing quick message timestamps: {e}")
-
-def init_db():
-    """Инициализация базы данных"""
-    logger.info("🔧 Initializing database...")
-    
-    with engine.begin() as conn:
-        # Создание таблицы users
-        conn.execute(DDL(f"""
-            CREATE TABLE IF NOT EXISTS {USERS_TABLE} (
-                id SERIAL PRIMARY KEY,
-                user_tg_id BIGINT UNIQUE NOT NULL,
-                username TEXT,
-                first_name TEXT,
-                last_name TEXT,
-                age INTEGER,
-                preferences TEXT,
-                last_preference_ask DATE,
-                last_holiday_suggest TIMESTAMPTZ,
-                last_auto_message TIMESTAMPTZ,
-                drink_count INTEGER DEFAULT 0,
-                last_drink_report DATE,
-                last_stats_reminder TIMESTAMPTZ,
-                limit_warning_sent DATE,
-                created_at TIMESTAMPTZ DEFAULT NOW()
-            )
-        """))
-        
-        # Добавляем колонку если её нет
-        conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS limit_warning_sent DATE"))
-        
-        # Создание таблицы messages
-        conn.execute(DDL(f"""
-            CREATE TABLE IF NOT EXISTS {MESSAGES_TABLE} (
-                id SERIAL PRIMARY KEY,
-                chat_id BIGINT NOT NULL,
-                user_tg_id BIGINT NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                created_at TIMESTAMPTZ DEFAULT NOW(),
-                reply_to_message_id INTEGER,
-                message_id INTEGER,
-                sticker_sent TEXT
-            )
-        """))
-        
-        # НОВАЯ ТАБЛИЦА: Детальное отслеживание выпитого
-        conn.execute(DDL(f"""
-            CREATE TABLE IF NOT EXISTS user_drinks (
-                id SERIAL PRIMARY KEY,
-                user_tg_id BIGINT NOT NULL,
-                chat_id BIGINT NOT NULL,
-                drink_type TEXT NOT NULL,
-                amount INTEGER NOT NULL,
-                unit TEXT NOT NULL,
-                drink_time TIMESTAMPTZ DEFAULT NOW(),
-                created_at TIMESTAMPTZ DEFAULT NOW()
-            )
-        """))
-        
-        # Добавляем колонки если их нет (для совместимости с существующими БД)
-        conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS chat_id BIGINT"))
-        conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS user_tg_id BIGINT"))
-        conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS age INTEGER"))
-        conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS preferences TEXT"))
-        conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS last_preference_ask DATE"))
-        conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS last_holiday_suggest TIMESTAMPTZ"))
-        conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS last_auto_message TIMESTAMPTZ"))
-        conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS drink_count INTEGER DEFAULT 0"))
-        conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS last_drink_report DATE"))
-        conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS last_stats_reminder TIMESTAMPTZ"))
-        conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS last_quick_message TIMESTAMPTZ"))
-        
-        conn.execute(DDL(f"ALTER TABLE {MESSAGES_TABLE} ADD COLUMN IF NOT EXISTS message_id INTEGER"))
-        conn.execute(DDL(f"ALTER TABLE {MESSAGES_TABLE} ADD COLUMN IF NOT EXISTS reply_to_message_id INTEGER"))
-        conn.execute(DDL(f"ALTER TABLE {MESSAGES_TABLE} ADD COLUMN IF NOT EXISTS sticker_sent TEXT"))
-        
-        # Создание таблицы для бесплатных напитков Кати
-        conn.execute(DDL(f"""
-            CREATE TABLE IF NOT EXISTS katya_free_drinks (
-                id SERIAL PRIMARY KEY,
-                chat_id BIGINT NOT NULL,
-                drinks_used INTEGER DEFAULT 0,
-                date_reset DATE DEFAULT CURRENT_DATE,
-                UNIQUE(chat_id, date_reset)
-            )
-        """))
-        
-        # Инициализируем timestamps быстрых сообщений
-        init_quick_message_timestamps()
-    
-    logger.info("✅ Database tables created/verified")
