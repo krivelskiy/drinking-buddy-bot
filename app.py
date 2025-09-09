@@ -2462,12 +2462,21 @@ def get_recent_messages(chat_id: int, limit: int = 20) -> list:
 def get_users_for_quick_message() -> list[dict]:
     """Получить пользователей, которым нужно отправить быстрое сообщение (15 минут)"""
     with engine.begin() as conn:
-        # Ищем пользователей, которым не отправляли быстрое сообщение более 15 минут
+        # Ищем пользователей, которые написали последнее сообщение более 15 минут назад
+        # И которым Катя не отправляла быстрое сообщение после этого
         query = f"""
             SELECT DISTINCT u.user_tg_id, u.chat_id, u.first_name, u.preferences, u.last_quick_message
             FROM {USERS_TABLE} u
-            WHERE u.last_quick_message IS NULL 
-               OR u.last_quick_message < NOW() - INTERVAL '15 minutes'
+            LEFT JOIN (
+                SELECT user_tg_id, MAX(created_at) as last_user_message_time
+                FROM {MESSAGES_TABLE}
+                WHERE role = 'user'
+                GROUP BY user_tg_id
+            ) m ON u.user_tg_id = m.user_tg_id
+            WHERE m.last_user_message_time IS NOT NULL
+               AND m.last_user_message_time < NOW() - INTERVAL '15 minutes'
+               AND (u.last_quick_message IS NULL 
+                    OR u.last_quick_message < m.last_user_message_time)
         """
         
         rows = conn.execute(text(query)).fetchall()
