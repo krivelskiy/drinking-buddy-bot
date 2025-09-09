@@ -394,10 +394,10 @@ def get_users_for_auto_message() -> list[dict]:
                 FROM {MESSAGES_TABLE}
                 GROUP BY user_tg_id
             ) m ON u.user_tg_id = m.user_tg_id
-            WHERE m.last_message_time IS NULL 
-               OR m.last_message_time < NOW() - INTERVAL '24 hours'
-               OR u.last_auto_message IS NULL 
-               OR u.last_auto_message < NOW() - INTERVAL '24 hours'
+            WHERE m.last_message_time IS NOT NULL
+              AND m.last_message_time < NOW() - INTERVAL '24 hours'
+              AND (u.last_auto_message IS NULL 
+                   OR u.last_auto_message < NOW() - INTERVAL '24 hours')
         """
         
         rows = conn.execute(text(query)).fetchall()
