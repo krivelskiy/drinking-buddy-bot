@@ -2621,6 +2621,7 @@ async def send_quick_messages():
 
 async def quick_message_scheduler():
     """Планировщик быстрых сообщений - каждые 5 минут"""
+    logger.info("🚀 DEBUG: quick_message_scheduler() запущен!")
     while True:
         try:
             await send_quick_messages()
