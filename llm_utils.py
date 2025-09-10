@@ -32,9 +32,11 @@ def llm_reply(text_in: str, user_tg_id: int, chat_id: int, recent_messages: List
     try:
         # Получаем информацию о пользователе
         from database import get_user_name, get_user_age
+        from db_utils import get_user_gender
         
         user_name = get_user_name(user_tg_id) or "друг"
         user_age = get_user_age(user_tg_id)
+        user_gender = get_user_gender(user_tg_id) or "неизвестен"
         
         # Строим контекст из последних сообщений
         context_messages = []
@@ -51,6 +53,8 @@ def llm_reply(text_in: str, user_tg_id: int, chat_id: int, recent_messages: List
         user_info = f"Пользователь: {user_name}"
         if user_age:
             user_info += f", возраст: {user_age} лет"
+        if user_gender != "неизвестен":
+            user_info += f", пол: {user_gender}"
         
         messages.append({"role": "system", "content": user_info})
         

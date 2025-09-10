@@ -17,6 +17,7 @@ def can_katya_drink_free(chat_id: int) -> bool:
     """Проверить, может ли Катя пить бесплатно"""
     try:
         with engine.begin() as conn:
+            # Сначала проверяем, существует ли таблица и поле
             result = conn.execute(
                 text("SELECT drinks_count FROM katya_free_drinks WHERE chat_id = :chat_id"),
                 {"chat_id": chat_id}
@@ -30,10 +31,19 @@ def can_katya_drink_free(chat_id: int) -> bool:
                     text("INSERT INTO katya_free_drinks (chat_id, drinks_count) VALUES (:chat_id, 0)"),
                     {"chat_id": chat_id}
                 )
-                return True
+                return True  # Первый напиток бесплатный
+                
     except Exception as e:
         logger.error(f"Error checking free drinks: {e}")
-        return False
+        # Если ошибка с полем, пытаемся пересоздать таблицу
+        try:
+            with engine.begin() as conn:
+                conn.execute(text("DROP TABLE IF EXISTS katya_free_drinks"))
+                conn.execute(text("CREATE TABLE katya_free_drinks (chat_id INTEGER PRIMARY KEY, drinks_count INTEGER)"))
+                return True # После пересоздания таблицы первый напиток бесплатный
+        except Exception as re_e:
+            logger.error(f"Error recreating table: {re_e}")
+            return False
 
 def increment_katya_drinks(chat_id: int) -> None:
     """Увеличить счетчик напитков Кати"""
@@ -72,6 +82,13 @@ async def send_sticker_by_command(bot, chat_id: int, command: str) -> None:
 async def send_gift_request(bot, chat_id: int, user_tg_id: int) -> None:
     """Отправить запрос на подарок"""
     try:
+        # Получаем информацию о пользователе для персонализации
+        from database import get_user_name
+        from db_utils import get_user_gender
+        
+        user_name = get_user_name(user_tg_id) or "друг"
+        user_gender = get_user_gender(user_tg_id) or "неизвестен"
+        
         # Список доступных напитков с ценами (временно все по 1 звезде)
         drinks = [
             {"name": "Пиво", "emoji": "🍺", "price": 1},
@@ -90,11 +107,22 @@ async def send_gift_request(bot, chat_id: int, user_tg_id: int) -> None:
             "drink_emoji": drink["emoji"]
         })
         
+        # Более тонкие и естественные описания
+        descriptions = [
+            f"Катя мечтает о {drink['name'].lower()}... Может, угостишь её? 💕",
+            f"Кате так хочется {drink['name'].lower()}! Подаришь ей радость? 💕",
+            f"Катя смотрит на {drink['name'].lower()} с надеждой... Поможешь? 💕",
+            f"Кате нужен {drink['name'].lower()} для хорошего настроения! 💕",
+            f"Катя просит {drink['name'].lower()}... Будет очень благодарна! 😘"
+        ]
+        
+        description = random.choice(descriptions)
+        
         # Отправляем invoice
         await bot.send_invoice(
             chat_id=chat_id,
-            title=f"Подарок для Кати: {drink['name']} {drink['emoji']}",
-            description=f"Подари Кате {drink['name'].lower()}! Она будет очень рада! 💕",
+            title=f"Угости Катю: {drink['name']} {drink['emoji']}",
+            description=description,
             payload=payload,
             provider_token="",  # Для тестовых платежей
             currency="XTR",  # Telegram Stars
