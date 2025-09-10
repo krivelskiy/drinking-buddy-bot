@@ -2572,11 +2572,11 @@ def reset_quick_message_flag(user_tg_id: int) -> None:
     try:
         with engine.begin() as conn:
             result = conn.execute(
-                text(f"UPDATE {USERS_TABLE} SET quick_message_sent = FALSE, last_quick_message = NOW() WHERE user_tg_id = :tg_id"),
+                text(f"UPDATE {USERS_TABLE} SET quick_message_sent = FALSE WHERE user_tg_id = :tg_id"),
                 {"tg_id": user_tg_id}
             )
             updated_count = result.rowcount
-            logger.info(f"Reset quick_message_sent flag and updated last_quick_message for user {user_tg_id}, rows affected: {updated_count}")
+            logger.info(f"Reset quick_message_sent flag for user {user_tg_id}, rows affected: {updated_count}")
     except Exception as e:
         logger.exception(f"Error resetting quick_message_sent flag for user {user_tg_id}: {e}")
 
