@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Optional
 import asyncio
 from datetime import datetime, timedelta
+import json
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
@@ -445,31 +446,44 @@ def get_users_for_auto_message() -> list[dict]:
 
 def generate_auto_message(first_name: str, preferences: Optional[str]) -> str:
     """Генерировать заманчивое сообщение для пользователя"""
-    messages = [
-        f"Привет, {first_name}! Соскучилась по нашим разговорам 😊 Давай выпьем и поболтаем?",
-        f"Эй, {first_name}! У меня есть отличная идея - давай отметим что-нибудь! 🍻",
-        f"{first_name}, я тут думаю... а не выпить ли нам? 😉",
-        f"Привет! Скучаю по нашей компании, {first_name}! Давай встретимся за рюмочкой?",
-        f"Эй, {first_name}! У меня настроение праздновать! Присоединяешься? 🥂",
-        f"Привет! Давай устроим вечеринку на двоих, {first_name}! 🎉",
-        f"{first_name}, я тут одна сижу... не соскучишься ли по мне? 😘",
-        f"Эй! У меня есть повод выпить! Хочешь узнать какой, {first_name}? 🍷",
-        f"Привет, {first_name}! Давай отметим что-нибудь хорошее! 🥃",
-        f"{first_name}, я тут думаю о тебе... а не выпить ли нам вместе? 😊"
-    ]
+    if client is None:
+        # Fallback если LLM недоступен
+        return f"Эй, {first_name}! Соскучилась по нашим разговорам  Давай выпьем и поболтаем?"
     
-    # Если есть предпочтения, добавляем их в сообщение
-    if preferences:
-        pref_messages = [
-            f"Привет, {first_name}! У меня есть твое любимое {preferences}! Давай выпьем? 🍻",
-            f"Эй, {first_name}! Я приготовила {preferences} специально для тебя! 😘",
-            f"{first_name}, помнишь как ты любишь {preferences}? Давай отметим! 🥂",
-            f"Привет! У меня есть {preferences} - твой любимый напиток! Присоединяешься? 🥂"
-        ]
-        messages.extend(pref_messages)
-    
-    import random
-    return random.choice(messages)
+    try:
+        # Строим промпт для LLM
+        prompt = f"""Ты — Катя Собутыльница. Нужно написать заманчивое сообщение пользователю {first_name}.
+
+ТРЕБОВАНИЯ:
+- Определи пол пользователя по имени {first_name} и используй правильный род
+- Будь дружелюбной и немного флиртующей
+- Сообщение должно быть коротким (1-2 предложения)
+- Добавь эмодзи
+- Не используй "Привет" в начале
+- Предложи выпить или поболтать
+- Используй правильные окончания для мужского/женского рода
+
+Примеры правильных окончаний:
+- Мужской род: "ты сделал", "ты самый лучший", "соскучилась по тебе"
+- Женский род: "ты сделала", "ты самая лучшая", "соскучилась по тебе"
+
+Предпочтения пользователя: {preferences or 'не указаны'}
+
+Создай одно заманчивое сообщение."""
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=150,
+            temperature=0.8
+        )
+        
+        return response.choices[0].message.content.strip()
+        
+    except Exception as e:
+        logger.error(f"Ошибка генерации автосообщения: {e}")
+        # Fallback
+        return f"Эй, {first_name}! Соскучилась по нашим разговорам  Давай выпьем и поболтаем?"
 
 def update_last_auto_message(user_tg_id: int) -> None:
     """Обновить дату последнего автоматического сообщения"""
@@ -491,7 +505,7 @@ async def send_auto_messages():
         
         for user in users:
             try:
-                message = generate_auto_message(user["first_name"] or "друг", user["preferences"])
+                message = generate_auto_message(user["first_name"] or generate_gender_neutral_greeting(user["user_tg_id"]), user["preferences"])
                 
                 # Отправляем сообщение через Telegram API
                 async with httpx.AsyncClient() as client:
@@ -949,12 +963,12 @@ async def gift_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     
     keyboard = [
         [
-            InlineKeyboardButton("🍷 Вино (250 ⭐)", callback_data="gift_wine"),
-            InlineKeyboardButton("🍸 Водка (100 ⭐)", callback_data="gift_vodka")
+            InlineKeyboardButton("🍷 Вино (1 ⭐)", callback_data="gift_wine"),
+            InlineKeyboardButton("🍸 Водка (1 ⭐)", callback_data="gift_vodka")
         ],
         [
-            InlineKeyboardButton("🥃 Виски (500 ⭐)", callback_data="gift_whisky"),
-            InlineKeyboardButton("🍺 Пиво (50 ⭐)", callback_data="gift_beer")
+            InlineKeyboardButton("🥃 Виски (1 ⭐)", callback_data="gift_whisky"),
+            InlineKeyboardButton("🍺 Пиво (1 ⭐)", callback_data="gift_beer")
         ]
     ]
     
@@ -982,10 +996,10 @@ async def gift_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     
     # Информация о напитках
     drink_info = {
-        "gift_wine": {"name": "🍷 Вино", "stars": 250, "sticker": "[SEND_DRINK_WINE]"},
-        "gift_vodka": {"name": "🍸 Водка", "stars": 100, "sticker": "[SEND_DRINK_VODKA]"},
-        "gift_whisky": {"name": "🥃 Виски", "stars": 500, "sticker": "[SEND_DRINK_WHISKY]"},
-        "gift_beer": {"name": "🍺 Пиво", "stars": 50, "sticker": "[SEND_DRINK_BEER]"}
+        "gift_wine": {"name": "🍷 Вино", "stars": 1, "sticker": "[SEND_DRINK_WINE]"},
+        "gift_vodka": {"name": "🍸 Водка", "stars": 1, "sticker": "[SEND_DRINK_VODKA]"},
+        "gift_whisky": {"name": "🥃 Виски", "stars": 1, "sticker": "[SEND_DRINK_WHISKY]"},
+        "gift_beer": {"name": "�� Пиво", "stars": 1, "sticker": "[SEND_DRINK_BEER]"}
     }
     
     if data not in drink_info:
@@ -1027,12 +1041,12 @@ async def show_gift_menu(query) -> None:
     
     keyboard = [
         [
-            InlineKeyboardButton("🍷 Вино (250 ⭐)", callback_data="gift_wine"),
-            InlineKeyboardButton("🍸 Водка (100 ⭐)", callback_data="gift_vodka")
+            InlineKeyboardButton("🍷 Вино (1 ⭐)", callback_data="gift_wine"),
+            InlineKeyboardButton("🍸 Водка (1 ⭐)", callback_data="gift_vodka")
         ],
         [
-            InlineKeyboardButton("🥃 Виски (500 ⭐)", callback_data="gift_whisky"),
-            InlineKeyboardButton("🍺 Пиво (50 ⭐)", callback_data="gift_beer")
+            InlineKeyboardButton("🥃 Виски (1 ⭐)", callback_data="gift_whisky"),
+            InlineKeyboardButton("🍺 Пиво (1 ⭐)", callback_data="gift_beer")
         ]
     ]
     
@@ -1055,54 +1069,38 @@ async def pre_checkout_query(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Подтверждаем платеж
     await query.answer(ok=True)
 
-async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик успешного платежа"""
-    if not update.message or not update.message.successful_payment:
-        return
-    
-    payment = update.message.successful_payment
-    user_tg_id = update.message.from_user.id
-    chat_id = update.message.chat_id
-    
-    logger.info(f"Successful payment from user {user_tg_id}: {payment.invoice_payload}")
-    
-    # Определяем какой напиток был куплен
-    drink_info = {
-        "wine": {"name": "🍷 Вино", "sticker": "[SEND_DRINK_WINE]", "emoji": "🍷"},
-        "vodka": {"name": "🍸 Водка", "sticker": "[SEND_DRINK_VODKA]", "emoji": "🍸"},
-        "whisky": {"name": "🥃 Виски", "sticker": "[SEND_DRINK_WHISKY]", "emoji": "🥃"},
-        "beer": {"name": "🍺 Пиво", "sticker": "[SEND_DRINK_BEER]", "emoji": "🍺"}
-    }
-    
-    drink_type = payment.invoice_payload
-    if drink_type not in drink_info:
-        drink_type = "wine"  # fallback
-    
-    drink = drink_info[drink_type]
-    
-    # Отправляем искреннюю благодарность
-    gratitude_messages = [
-        f"🎉 Ого! Ты подарил мне {drink['name']}!",
-        f"💕 Я так рада! Спасибо тебе огромное!",
-        f" Ты самый лучший! Сейчас выпью твой подарок!",
-        f"{drink['emoji']} *выпивает* Ммм, как вкусно!",
-        f"💖 Ты сделал мой день! Обнимаю тебя! 🤗"
-    ]
-    
-    for i, message in enumerate(gratitude_messages):
-        try:
-            await update.message.reply_text(message)
-            if i == 0:  # После первого сообщения отправляем стикер
-                await send_sticker_by_command(chat_id, drink['sticker'])
-        except Exception as e:
-            logger.exception(f"Failed to send gratitude message {i}: {e}")
-    
-    # Сохраняем сообщения благодарности
+async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка успешной оплаты"""
     try:
-        for message in gratitude_messages:
-            save_message(chat_id, user_tg_id, "assistant", message)
+        query = update.pre_checkout_query
+        user_tg_id = query.from_user.id
+        chat_id = query.from_user.id
+        
+        # Получаем информацию о напитке из payload
+        payload_data = json.loads(query.invoice_payload)
+        drink_name = payload_data.get('drink_name', 'напиток')
+        drink_emoji = payload_data.get('drink_emoji', '')
+        
+        # Подтверждаем оплату
+        await query.answer(ok=True)
+        
+        # Генерируем благодарственные сообщения с учетом пола
+        gratitude_messages = generate_gender_appropriate_gratitude(user_tg_id, drink_name, drink_emoji)
+        
+        # Отправляем сообщения с задержкой
+        for i, message in enumerate(gratitude_messages):
+            await asyncio.sleep(1.5)  # Задержка между сообщениями
+            await context.bot.send_message(chat_id=chat_id, text=message)
+        
+        # Обновляем счетчик бесплатных напитков
+        await update_katya_free_drinks(1)
+        
+        logger.info(f"Successful payment processed for user {user_tg_id}, drink: {drink_name}")
+        
     except Exception as e:
-        logger.exception(f"Failed to save gratitude messages: {e}")
+        logger.error(f"Error processing successful payment: {e}")
+        if query:
+            await query.answer(ok=False, error_message="Произошла ошибка при обработке платежа")
 
 # -----------------------------
 # Хендлер сообщений
@@ -1156,7 +1154,7 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             is_over_limit, total_amount = check_daily_limit(user_tg_id)
             if is_over_limit:
                 # Получаем имя пользователя для персонализированного сообщения
-                user_name = get_user_name(user_tg_id) or "друг"
+                user_name = get_user_name(user_tg_id) or generate_gender_neutral_greeting(user_tg_id)
                 
                 # Используем LLM для генерации предупреждения БЕЗ приветствия
                 warning_prompt = f"""Ты — Катя Собутыльница. Пользователь {user_name} уже выпил {total_amount} порций сегодня. 
@@ -2476,7 +2474,9 @@ def get_users_for_quick_message() -> list[dict]:
             WHERE m.last_user_message_time IS NOT NULL
                AND m.last_user_message_time < NOW() - INTERVAL '15 minutes'
                AND (u.last_quick_message IS NULL 
-                    OR u.last_quick_message < NOW() - INTERVAL '15 minutes')
+                    OR u.last_quick_message < m.last_user_message_time)
+               AND (u.last_auto_message IS NULL
+                    OR u.last_auto_message < m.last_user_message_time)
         """
         
         rows = conn.execute(text(query)).fetchall()
@@ -2511,53 +2511,43 @@ def generate_quick_message_llm(first_name: str, preferences: Optional[str], user
         holidays = get_today_holidays()
         holiday_context = ""
         if holidays:
-            holiday_context = f"\nСегодня праздник: {', '.join(holidays)}. Это отличный повод выпить!"
+            holiday_context = f"\nСегодня праздник: {', '.join(holidays)}"
         
-        # Строим специальный промпт для быстрых сообщений
-        prompt = f"""{SYSTEM_PROMPT}
-
-Информация о пользователе: {user_facts}
-Предпочтения в напитках: {preferences or "не указаны"}
-Сегодня: {day_info['day_name'].capitalize()}
-{holiday_context}
-
-ЗАДАЧА: Напиши короткое, дерзкое и интригующее сообщение для пользователя {first_name}, чтобы он захотел продолжить диалог.
+        # Строим промпт для LLM
+        prompt = f"""Ты — Катя Собутыльница. Нужно написать быстрое сообщение пользователю {first_name} для поддержания диалога.
 
 ТРЕБОВАНИЯ:
+- Определи пол пользователя по имени {first_name} и используй правильный род
+- Будь дружелюбной и немного флиртующей
 - Сообщение должно быть коротким (1-2 предложения)
-- Должно быть дерзким, игривым и интригующим
-- Должно заинтересовать пользователя продолжить разговор
-- Используй имя пользователя: {first_name}
-- Будь флиртующей и немного провокационной
-- Не используй "Привет" или другие формальные приветствия
-- Можешь упомянуть алкоголь или выпивку
-- Добавь эмодзи для живости
-- Сообщение должно быть уникальным и интересным
+- Добавь эмодзи
+- Не используй "Привет" в начале
+- Используй правильные окончания для мужского/женского рода
+- Будь дерзкой и заманчивой
 
-Примеры стиля:
-- "Эй, {first_name}! Скучаешь по мне? Я тут одна, не хочешь составить компанию? 😏"
-- "{first_name}, а что если мы устроим что-то незабываемое? Только мы двое... "
-- "Привет, красавчик! Не хочешь узнать мой секрет? 😘"
+Примеры правильных окончаний:
+- Мужской род: "ты сделал", "ты самый лучший", "соскучилась по тебе"
+- Женский род: "ты сделала", "ты самая лучшая", "соскучилась по тебе"
 
-Сообщение:"""
+Информация о пользователе: {user_facts}
+День недели: {day_info}
+Предпочтения: {preferences or 'не указаны'}{holiday_context}
 
-        # Вызываем LLM
+Создай одно дерзкое и заманчивое сообщение."""
+
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=100,
-            temperature=0.9  # Высокая температура для креативности
+            max_tokens=150,
+            temperature=0.8
         )
         
-        message = response.choices[0].message.content.strip()
-        logger.info(f"Generated quick message for user {user_tg_id}: {repr(message)}")
-        
-        return message
+        return response.choices[0].message.content.strip()
         
     except Exception as e:
-        logger.exception(f"Error generating quick message for user {user_tg_id}: {e}")
-        # Fallback сообщение
-        return f"Эй, {first_name}! Не скучай без меня! 😊"
+        logger.error(f"Ошибка генерации быстрого сообщения: {e}")
+        # Fallback
+        return f"Эй, {first_name}! Не скучай без меня! "
 
 def generate_quick_message(first_name: str, preferences: Optional[str]) -> str:
     """Генерация быстрого сообщения для поддержания диалога (legacy функция)"""
@@ -2591,7 +2581,7 @@ async def send_quick_messages():
                 
                 # Используем LLM для генерации уникального сообщения
                 message = generate_quick_message_llm(
-                    user["first_name"] or "друг", 
+                    user["first_name"] or generate_gender_neutral_greeting(user["user_tg_id"]), 
                     user["preferences"], 
                     user["user_tg_id"]
                 )
@@ -2633,3 +2623,144 @@ async def quick_message_scheduler():
         except Exception as e:
             logger.exception(f"Error in quick_message_scheduler: {e}")
             await asyncio.sleep(60)  # При ошибке ждем минуту
+
+# Добавляем функцию для определения пола пользователя
+def detect_user_gender(user_tg_id: int, first_name: str = None) -> str:
+    """Определяет пол пользователя по имени или возвращает нейтральный вариант"""
+    if not first_name:
+        first_name = get_user_name(user_tg_id) or ""
+    
+    # Список женских имен (можно расширить)
+    female_names = [
+        "анна", "елена", "мария", "наталья", "ольга", "татьяна", "ирина", "светлана",
+        "екатерина", "юлия", "александра", "дарья", "марина", "надежда", "валентина",
+        "галина", "людмила", "раиса", "зоя", "валентина", "лидия", "нина", "вера",
+        "любовь", "тамара", "раиса", "зоя", "валентина", "лидия", "нина", "вера",
+        "катя", "катерина", "катюша", "катенька", "катюшка", "катюшенька"
+    ]
+    
+    # Список мужских имен (можно расширить)
+    male_names = [
+        "александр", "дмитрий", "максим", "сергей", "андрей", "алексей", "артём",
+        "илья", "кирилл", "михаил", "николай", "евгений", "данил", "денис", "владимир",
+        "павел", "артём", "рома", "владислав", "иван", "егор", "николай", "артём",
+        "миша", "мишенька", "мишутка", "мишаня", "мишанька"
+    ]
+    
+    first_name_lower = first_name.lower().strip()
+    
+    # Проверяем женские имена
+    for name in female_names:
+        if name in first_name_lower:
+            return "female"
+    
+    # Проверяем мужские имена
+    for name in male_names:
+        if name in first_name_lower:
+            return "male"
+    
+    # Если не определили - возвращаем нейтральный вариант
+    return "neutral"
+
+def generate_gender_appropriate_gratitude(user_tg_id: int, drink_name: str, drink_emoji: str) -> list[str]:
+    """Генерирует благодарственные сообщения с учетом пола пользователя"""
+    if client is None:
+        # Fallback если LLM недоступен
+        return [
+            f" Ого! Ты подарил(а) мне {drink_name}!",
+            f"💕 Я так рада! Спасибо тебе огромное!",
+            f" Ты самый(ая) лучший(ая)! Сейчас выпью твой подарок!",
+            f"{drink_emoji} *выпивает* Ммм, как вкусно!",
+            f"💖 Ты сделал(а) мой день! Обнимаю тебя! 🤗"
+        ]
+    
+    try:
+        # Получаем информацию о пользователе
+        user_facts = get_user_facts(user_tg_id)
+        
+        # Строим промпт для LLM
+        prompt = f"""Ты — Катя Собутыльница. Пользователь {user_facts.get('name', 'друг')} подарил тебе {drink_name}.
+
+ТРЕБОВАНИЯ:
+- Определи пол пользователя по имени {user_facts.get('name', 'друг')} и используй правильный род
+- Будь очень радостной и благодарной
+- Создай 5 коротких сообщений (по 1-2 предложения каждое)
+- Добавь эмодзи
+- Используй правильные окончания для мужского/женского рода
+- Будь милой и флиртующей
+
+Примеры правильных окончаний:
+- Мужской род: "ты сделал", "ты самый лучший", "спасибо тебе"
+- Женский род: "ты сделала", "ты самая лучшая", "спасибо тебе"
+
+Создай 5 сообщений, разделенных переносами строк."""
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=300,
+            temperature=0.8
+        )
+        
+        messages = response.choices[0].message.content.strip().split('\n')
+        return [msg.strip() for msg in messages if msg.strip()]
+        
+    except Exception as e:
+        logger.error(f"Ошибка генерации благодарственных сообщений: {e}")
+        # Fallback
+        return [
+            f" Ого! Ты подарил(а) мне {drink_name}!",
+            f"💕 Я так рада! Спасибо тебе огромное!",
+            f" Ты самый(ая) лучший(ая)! Сейчас выпью твой подарок!",
+            f"{drink_emoji} *выпивает* Ммм, как вкусно!",
+            f"💖 Ты сделал(а) мой день! Обнимаю тебя! 🤗"
+        ]
+
+def generate_gender_neutral_greeting(user_tg_id: int, first_name: str = None) -> str:
+    """Генерирует нейтральное обращение к пользователю через LLM"""
+    if not first_name:
+        first_name = get_user_name(user_tg_id) or "друг"
+    
+    if client is None:
+        # Fallback если LLM недоступен
+        return first_name
+    
+    try:
+        # Строим промпт для LLM
+        prompt = f"""Ты — Катя Собутыльница. Нужно определить правильное обращение к пользователю с именем "{first_name}".
+
+ТРЕБОВАНИЯ:
+- Определи пол пользователя по имени "{first_name}"
+- Верни ТОЛЬКО одно слово - правильное обращение
+- Для мужчин: "друг", "красавчик", "парень" 
+- Для женщин: "подруга", "красавица", "девушка"
+- Если не уверен в поле: "друг"
+
+Примеры:
+- "Михаил" → "друг"
+- "Анна" → "подруга" 
+- "Александр" → "друг"
+- "Елена" → "подруга"
+- "Алекс" → "друг" (неопределенное имя)
+
+Отвечай ТОЛЬКО одним словом."""
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=10,
+            temperature=0.3
+        )
+        
+        greeting = response.choices[0].message.content.strip().lower()
+        
+        # Валидация ответа
+        valid_greetings = ["друг", "подруга", "красавчик", "красавица", "парень", "девушка"]
+        if greeting in valid_greetings:
+            return greeting
+        else:
+            return "друг"  # Fallback
+        
+    except Exception as e:
+        logger.error(f"Ошибка генерации обращения: {e}")
+        return "друг"  # Fallback
