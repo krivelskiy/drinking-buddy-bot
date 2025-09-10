@@ -580,6 +580,21 @@ def generate_gender_appropriate_greeting(name: str, gender: Optional[str] = None
 # FastAPI endpoints
 # -----------------------------
 
+@app.get("/")
+async def root():
+    """Корневой endpoint"""
+    return {
+        "message": "Drinking Buddy Bot API",
+        "status": "running",
+        "version": "1.0.0",
+        "endpoints": {
+            "health": "/health",
+            "metrics": "/metrics",
+            "webhook": "/webhook (POST)"
+        },
+        "timestamp": datetime.now().isoformat()
+    }
+
 @app.get("/health")
 async def health_check():
     """Проверка здоровья приложения"""
