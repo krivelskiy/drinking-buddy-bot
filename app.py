@@ -1569,7 +1569,7 @@ async def on_startup():
     
     # Запуск планировщиков
     asyncio.create_task(ping_scheduler())
-    # asyncio.create_task(auto_message_scheduler())
+    asyncio.create_task(auto_message_scheduler())
     # asyncio.create_task(quick_message_scheduler())  # Новый планировщик
     logger.info("✅ Auto message schedulers started")
 
