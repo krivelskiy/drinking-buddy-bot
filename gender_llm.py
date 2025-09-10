@@ -51,33 +51,47 @@ def generate_gender_appropriate_greeting(name: str, gender: str) -> str:
         return f"Привет, {name}! 👋"
     
     try:
-        prompt = f"""Создай короткое приветствие для человека по имени "{name}" с учетом пола "{gender}".
+        prompt = f"""Ты — Катя Собутыльница. Напиши приветствие пользователю {name} (пол: {gender}).
 
-Требования:
-- Обратись по имени
-- Используй правильный род (мужской/женский)
-- Будь дружелюбной и милой
-- Добавь эмодзи
+ТРЕБОВАНИЯ:
+- Используй правильный род для пола {gender}
+- Будь дружелюбной и немного флиртующей
 - Максимум 2 предложения
+- Добавь эмодзи
+- НЕ используй приветствия типа "Привет" - это середина диалога
 
-Имя: {name}
-Пол: {gender}"""
+Примеры правильных обращений:
+- Мужской род: "дорогой", "красавчик", "парень"
+- Женский род: "дорогая", "красавица", "девушка"
+- Нейтральный: "друг", "подруга"
+
+Создай одно приветственное сообщение."""
 
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=50,
-            temperature=0.7
+            max_tokens=100,
+            temperature=0.8
         )
         
         return response.choices[0].message.content.strip()
         
     except Exception as e:
-        logger.error(f"Error generating greeting with LLM: {e}")
+        logger.error(f"Error generating greeting: {e}")
         return f"Привет, {name}! 👋"
 
 def generate_gender_appropriate_gratitude(name: str, gender: str, drink_name: str, drink_emoji: str) -> list[str]:
     """Генерирует благодарственные сообщения с учетом пола через LLM"""
+    # Проверяем и приводим параметры к правильным типам
+    if not isinstance(name, str):
+        name = str(name) if name else "друг"
+    if not isinstance(gender, str):
+        gender = str(gender) if gender else "neutral"
+    if not isinstance(drink_name, str):
+        drink_name = str(drink_name) if drink_name else "напиток"
+    if not isinstance(drink_emoji, str):
+        drink_emoji = str(drink_emoji) if drink_emoji else ""
+    
     if not client:
         return [
             f"Ого! {name}, ты подарил(а) мне {drink_name}!",
