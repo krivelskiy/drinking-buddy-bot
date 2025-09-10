@@ -1072,17 +1072,19 @@ async def pre_checkout_query(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка успешной оплаты"""
     try:
-        query = update.pre_checkout_query
-        user_tg_id = query.from_user.id
-        chat_id = query.from_user.id
+        # Для SUCCESSFUL_PAYMENT сообщений данные находятся в update.message.successful_payment
+        if not update.message or not update.message.successful_payment:
+            logger.error("No successful payment data found in update")
+            return
+            
+        payment = update.message.successful_payment
+        user_tg_id = update.message.from_user.id
+        chat_id = update.message.chat_id
         
         # Получаем информацию о напитке из payload
-        payload_data = json.loads(query.invoice_payload)
+        payload_data = json.loads(payment.invoice_payload)
         drink_name = payload_data.get('drink_name', 'напиток')
         drink_emoji = payload_data.get('drink_emoji', '')
-        
-        # Подтверждаем оплату
-        await query.answer(ok=True)
         
         # Генерируем благодарственные сообщения с учетом пола
         gratitude_messages = generate_gender_appropriate_gratitude(user_tg_id, drink_name, drink_emoji)
@@ -1099,8 +1101,6 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
         
     except Exception as e:
         logger.error(f"Error processing successful payment: {e}")
-        if query:
-            await query.answer(ok=False, error_message="Произошла ошибка при обработке платежа")
 
 # -----------------------------
 # Хендлер сообщений
