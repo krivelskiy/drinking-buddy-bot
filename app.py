@@ -609,8 +609,8 @@ async def get_metrics():
         "timestamp": datetime.now().isoformat()
     }
 
-@app.post("/webhook")
-async def webhook(request: Request):
+@app.post("/webhook/{bot_token}")
+async def webhook(bot_token: str, request: Request):
     """Webhook для Telegram"""
     try:
         data = await request.json()
