@@ -2623,6 +2623,9 @@ async def send_quick_messages():
 async def quick_message_scheduler():
     """Планировщик быстрых сообщений - каждые 5 минут"""
     logger.info("🚀 DEBUG: quick_message_scheduler() запущен!")
+    # Ждем 30 секунд перед первым запуском, чтобы приложение успело запуститься
+    await asyncio.sleep(30)
+    
     while True:
         try:
             await send_quick_messages()
