@@ -2476,7 +2476,7 @@ def get_users_for_quick_message() -> list[dict]:
             WHERE m.last_user_message_time IS NOT NULL
                AND m.last_user_message_time < NOW() - INTERVAL '15 minutes'
                AND (u.last_quick_message IS NULL 
-                    OR u.last_quick_message < m.last_user_message_time)
+                    OR u.last_quick_message < NOW() - INTERVAL '15 minutes')
         """
         
         rows = conn.execute(text(query)).fetchall()
