@@ -1081,10 +1081,21 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
         user_tg_id = update.message.from_user.id
         chat_id = update.message.chat_id
         
-        # Получаем информацию о напитке из payload
-        payload_data = json.loads(payment.invoice_payload)
-        drink_name = payload_data.get('drink_name', 'напиток')
-        drink_emoji = payload_data.get('drink_emoji', '')
+        # Получаем информацию о напитке из payload с проверкой
+        drink_name = 'напиток'
+        drink_emoji = ''
+        
+        try:
+            if payment.invoice_payload:
+                payload_data = json.loads(payment.invoice_payload)
+                drink_name = payload_data.get('drink_name', 'напиток')
+                drink_emoji = payload_data.get('drink_emoji', '')
+                logger.info(f"Parsed payload: {payload_data}")
+            else:
+                logger.warning("Empty invoice_payload")
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse invoice_payload: {payment.invoice_payload}, error: {e}")
+            # Используем значения по умолчанию
         
         # Генерируем благодарственные сообщения с учетом пола
         gratitude_messages = generate_gender_appropriate_gratitude(user_tg_id, drink_name, drink_emoji)
