@@ -2464,6 +2464,7 @@ def get_users_for_quick_message() -> list[dict]:
     with engine.begin() as conn:
         # Ищем пользователей, которые написали последнее сообщение более 15 минут назад
         # И которым Катя не отправляла быстрое сообщение после этого
+        # И если Катя уже отправляла быстрое сообщение, то проверяем, что пользователь ответил
         query = f"""
             SELECT DISTINCT u.user_tg_id, u.chat_id, u.first_name, u.preferences, u.last_quick_message
             FROM {USERS_TABLE} u
@@ -2473,10 +2474,18 @@ def get_users_for_quick_message() -> list[dict]:
                 WHERE role = 'user'
                 GROUP BY user_tg_id
             ) m ON u.user_tg_id = m.user_tg_id
+            LEFT JOIN (
+                SELECT user_tg_id, MAX(created_at) as last_katya_message_time
+                FROM {MESSAGES_TABLE}
+                WHERE role = 'assistant'
+                GROUP BY user_tg_id
+            ) k ON u.user_tg_id = k.user_tg_id
             WHERE m.last_user_message_time IS NOT NULL
                AND m.last_user_message_time < NOW() - INTERVAL '15 minutes'
                AND (u.last_quick_message IS NULL 
                     OR u.last_quick_message < m.last_user_message_time)
+               AND (k.last_katya_message_time IS NULL 
+                    OR k.last_katya_message_time < m.last_user_message_time)
         """
         
         rows = conn.execute(text(query)).fetchall()
