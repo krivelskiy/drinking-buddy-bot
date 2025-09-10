@@ -135,6 +135,8 @@ async def send_gift_request(bot, chat_id: int, user_tg_id: int) -> None:
         
         description = random.choice(descriptions)
         
+        logger.info(f"Sending gift request with {len(prices)} drinks: {[p['label'] for p in prices]}")
+        
         # Отправляем invoice с общим списком напитков
         await bot.send_invoice(
             chat_id=chat_id,
@@ -145,6 +147,8 @@ async def send_gift_request(bot, chat_id: int, user_tg_id: int) -> None:
             currency="XTR",  # Telegram Stars
             prices=prices
         )
+        
+        logger.info(f"Successfully sent gift request to user {user_tg_id}")
         
     except Exception as e:
         logger.error(f"Error sending gift request: {e}") 
