@@ -216,6 +216,7 @@ def init_db():
         conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS last_drink_report DATE"))
         conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS last_stats_reminder TIMESTAMPTZ"))
         conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS last_quick_message TIMESTAMPTZ"))
+        conn.execute(DDL(f"ALTER TABLE {USERS_TABLE} ADD COLUMN IF NOT EXISTS quick_message_sent BOOLEAN DEFAULT TRUE"))
         
         conn.execute(DDL(f"ALTER TABLE {MESSAGES_TABLE} ADD COLUMN IF NOT EXISTS message_id INTEGER"))
         conn.execute(DDL(f"ALTER TABLE {MESSAGES_TABLE} ADD COLUMN IF NOT EXISTS reply_to_message_id INTEGER"))
@@ -416,21 +417,20 @@ def update_last_holiday_suggest(user_tg_id: int) -> None:
 # Система автоматических сообщений
 # -----------------------------
 def get_users_for_auto_message() -> list[dict]:
-    """Получить пользователей, которым нужно отправить автоматическое сообщение"""
+    """Получить пользователей, которым нужно отправить автоматическое сообщение (24 часа)"""
     with engine.begin() as conn:
-        # Ищем пользователей, с которыми не общались более 24 часов
+        # Новый алгоритм: ищем пользователей, которые написали последнее сообщение более 24 часов назад
         query = f"""
             SELECT DISTINCT u.user_tg_id, u.chat_id, u.first_name, u.preferences
             FROM {USERS_TABLE} u
             LEFT JOIN (
-                SELECT user_tg_id, MAX(created_at) as last_message_time
+                SELECT user_tg_id, MAX(created_at) as last_user_message_time
                 FROM {MESSAGES_TABLE}
+                WHERE role = 'user'
                 GROUP BY user_tg_id
             ) m ON u.user_tg_id = m.user_tg_id
-            WHERE m.last_message_time IS NOT NULL
-              AND m.last_message_time < NOW() - INTERVAL '24 hours'
-              AND (u.last_auto_message IS NULL 
-                   OR u.last_auto_message < NOW() - INTERVAL '24 hours')
+            WHERE m.last_user_message_time IS NOT NULL
+              AND m.last_user_message_time < NOW() - INTERVAL '24 hours'
         """
         
         rows = conn.execute(text(query)).fetchall()
@@ -486,12 +486,12 @@ def generate_auto_message(first_name: str, preferences: Optional[str]) -> str:
         return f"Эй, {first_name}! Соскучилась по нашим разговорам  Давай выпьем и поболтаем?"
 
 def update_last_auto_message(user_tg_id: int) -> None:
-    """Обновить дату последнего автоматического сообщения"""
+    """Обновить дату последнего автоматического сообщения и сбросить флаг быстрого сообщения"""
     with engine.begin() as conn:
         conn.execute(
             text(f"""
                 UPDATE {USERS_TABLE}
-                SET last_auto_message = NOW()
+                SET last_auto_message = NOW(), quick_message_sent = FALSE
                 WHERE {U['user_tg_id']} = :tg_id
             """),
             {"tg_id": user_tg_id}
@@ -1116,6 +1116,9 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     chat_id = update.message.chat_id
     
     logger.info(f"Received message: {text_in} from user {user_tg_id}")
+    
+    # Сбрасываем флаг быстрого сообщения при получении сообщения от пользователя
+    reset_quick_message_flag(user_tg_id)
     
     # ВАЖНО: Проверяем статистику ПЕРВОЙ!
     if any(word in text_in.lower() for word in ['статистика', 'сколько выпил', 'сколько пил', 'статистик']):
@@ -2460,8 +2463,8 @@ def get_recent_messages(chat_id: int, limit: int = 20) -> list:
 def get_users_for_quick_message() -> list[dict]:
     """Получить пользователей, которым нужно отправить быстрое сообщение (15 минут)"""
     with engine.begin() as conn:
-        # Ищем пользователей, которые написали последнее сообщение более 15 минут назад
-        # И которым Катя не отправляла быстрое сообщение после этого
+        # Новый алгоритм: ищем пользователей, которые написали последнее сообщение более 15 минут назад
+        # И у которых флаг quick_message_sent = FALSE
         query = f"""
             SELECT DISTINCT u.user_tg_id, u.chat_id, u.first_name, u.preferences, u.last_quick_message
             FROM {USERS_TABLE} u
@@ -2473,11 +2476,7 @@ def get_users_for_quick_message() -> list[dict]:
             ) m ON u.user_tg_id = m.user_tg_id
             WHERE m.last_user_message_time IS NOT NULL
                AND m.last_user_message_time < NOW() - INTERVAL '15 minutes'
-               AND (u.last_quick_message IS NULL 
-                    OR u.last_quick_message < m.last_user_message_time)
-               AND (u.last_auto_message IS NULL
-                    OR u.last_auto_message < m.last_user_message_time
-                    OR u.last_auto_message < NOW() - INTERVAL '24 hours')
+               AND u.quick_message_sent = FALSE
         """
         
         rows = conn.execute(text(query)).fetchall()
@@ -2556,17 +2555,30 @@ def generate_quick_message(first_name: str, preferences: Optional[str]) -> str:
     return f"Эй, {first_name}! Не скучай без меня! "
 
 def update_last_quick_message(user_tg_id: int) -> None:
-    """Обновить время последнего быстрого сообщения"""
+    """Обновить время последнего быстрого сообщения и установить флаг"""
     try:
         with engine.begin() as conn:
             result = conn.execute(
-                text(f"UPDATE {USERS_TABLE} SET last_quick_message = NOW() WHERE user_tg_id = :tg_id"),
+                text(f"UPDATE {USERS_TABLE} SET last_quick_message = NOW(), quick_message_sent = TRUE WHERE user_tg_id = :tg_id"),
                 {"tg_id": user_tg_id}
             )
             updated_count = result.rowcount
-            logger.info(f"Updated last_quick_message for user {user_tg_id}, rows affected: {updated_count}")
+            logger.info(f"Updated last_quick_message and set quick_message_sent=TRUE for user {user_tg_id}, rows affected: {updated_count}")
     except Exception as e:
         logger.exception(f"Error updating last_quick_message for user {user_tg_id}: {e}")
+
+def reset_quick_message_flag(user_tg_id: int) -> None:
+    """Сбросить флаг быстрого сообщения при получении сообщения от пользователя"""
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(
+                text(f"UPDATE {USERS_TABLE} SET quick_message_sent = FALSE WHERE user_tg_id = :tg_id"),
+                {"tg_id": user_tg_id}
+            )
+            updated_count = result.rowcount
+            logger.info(f"Reset quick_message_sent flag for user {user_tg_id}, rows affected: {updated_count}")
+    except Exception as e:
+        logger.exception(f"Error resetting quick_message_sent flag for user {user_tg_id}: {e}")
 
 async def send_quick_messages():
     """Отправить быстрые сообщения пользователям"""
