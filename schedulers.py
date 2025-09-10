@@ -14,7 +14,7 @@ from llm_utils import generate_quick_message_llm, generate_auto_message_llm
 
 logger = logging.getLogger(__name__)
 
-async def send_quick_messages():
+async def send_quick_messages(bot):
     """Отправить быстрые сообщения пользователям"""
     logger.info("🔍 DEBUG: send_quick_messages() вызвана!")
     try:
@@ -34,7 +34,6 @@ async def send_quick_messages():
                 )
                 
                 # Отправляем сообщение
-                from app import bot
                 await bot.send_message(chat_id=user["chat_id"], text=message)
                 
                 logger.info(f"Quick message sent to user {user['user_tg_id']}: {message[:50]}...")
@@ -45,9 +44,9 @@ async def send_quick_messages():
     except Exception as e:
         logger.error(f"Error in send_quick_messages: {e}")
 
-async def send_auto_messages():
+async def send_auto_messages(bot):
     """Отправить автоматические сообщения пользователям"""
-    logger.info("�� DEBUG: send_auto_messages() вызвана!")
+    logger.info(" DEBUG: send_auto_messages() вызвана!")
     try:
         users = get_users_for_auto_message()
         logger.info(f"Found {len(users)} users for auto messages")
@@ -65,7 +64,6 @@ async def send_auto_messages():
                 )
                 
                 # Отправляем сообщение
-                from app import bot
                 await bot.send_message(chat_id=user["chat_id"], text=message)
                 
                 logger.info(f"Auto message sent to user {user['user_tg_id']}: {message[:50]}...")
@@ -76,23 +74,23 @@ async def send_auto_messages():
     except Exception as e:
         logger.error(f"Error in send_auto_messages: {e}")
 
-async def quick_message_scheduler():
+async def quick_message_scheduler(bot):
     """Планировщик быстрых сообщений (каждые 30 секунд)"""
     logger.info("🚀 DEBUG: quick_message_scheduler() запущен!")
     while True:
         try:
-            await send_quick_messages()
+            await send_quick_messages(bot)
         except Exception as e:
             logger.error(f"Error in quick_message_scheduler: {e}")
         
         await asyncio.sleep(30)  # Проверяем каждые 30 секунд
 
-async def auto_message_scheduler():
+async def auto_message_scheduler(bot):
     """Планировщик автоматических сообщений (каждые 5 минут)"""
     logger.info("🚀 DEBUG: auto_message_scheduler() запущен!")
     while True:
         try:
-            await send_auto_messages()
+            await send_auto_messages(bot)
         except Exception as e:
             logger.error(f"Error in auto_message_scheduler: {e}")
         
