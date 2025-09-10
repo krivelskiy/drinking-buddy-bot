@@ -231,6 +231,52 @@ def init_db():
         raise
 
 # -----------------------------
+# FastAPI startup/shutdown events
+# -----------------------------
+
+@app.on_event("startup")
+async def startup_event():
+    """Инициализация при запуске"""
+    try:
+        # Инициализируем базу данных
+        init_db()
+        
+        # Запускаем миграции
+        run_migrations()
+        
+        # Инициализируем Telegram приложение
+        await telegram_app.initialize()
+        
+        # Добавляем обработчики
+        telegram_app.add_handler(CommandHandler("start", start))
+        telegram_app.add_handler(CommandHandler("help", help_command))
+        telegram_app.add_handler(CommandHandler("stats", stats_command))
+        telegram_app.add_handler(CommandHandler("gift", gift_command))
+        telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_handler))
+        telegram_app.add_handler(PreCheckoutQueryHandler(pre_checkout_callback))
+        telegram_app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
+        
+        # Запускаем планировщики
+        asyncio.create_task(ping_scheduler())
+        asyncio.create_task(quick_message_scheduler(bot))
+        asyncio.create_task(auto_message_scheduler(bot))
+        
+        logger.info("Application started successfully")
+        
+    except Exception as e:
+        logger.error(f"Failed to start application: {e}")
+        raise
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Очистка при завершении"""
+    try:
+        await telegram_app.shutdown()
+        logger.info("Application shutdown completed")
+    except Exception as e:
+        logger.error(f"Error during shutdown: {e}")
+
+# -----------------------------
 # Обработчики команд
 # -----------------------------
 
@@ -590,7 +636,7 @@ async def root():
         "endpoints": {
             "health": "/health",
             "metrics": "/metrics",
-            "webhook": "/webhook (POST)"
+            "webhook": "/webhook/{bot_token} (POST)"
         },
         "timestamp": datetime.now().isoformat()
     }
@@ -622,43 +668,9 @@ async def webhook(bot_token: str, request: Request):
         raise HTTPException(status_code=500, detail="Internal server error")
 
 # -----------------------------
-# Запуск приложения
+# Запуск приложения (только для локального тестирования)
 # -----------------------------
 
-async def main():
-    """Основная функция запуска"""
-    try:
-        # Инициализируем базу данных
-        init_db()
-        
-        # Запускаем миграции
-        run_migrations()
-        
-        # Добавляем обработчики
-        telegram_app.add_handler(CommandHandler("start", start))
-        telegram_app.add_handler(CommandHandler("help", help_command))
-        telegram_app.add_handler(CommandHandler("stats", stats_command))
-        telegram_app.add_handler(CommandHandler("gift", gift_command))
-        telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_handler))
-        telegram_app.add_handler(PreCheckoutQueryHandler(pre_checkout_callback))
-        telegram_app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
-        
-        # Запускаем планировщики
-        asyncio.create_task(ping_scheduler())
-        asyncio.create_task(quick_message_scheduler())
-        asyncio.create_task(auto_message_scheduler())
-        
-        # Запускаем бота
-        await telegram_app.initialize()
-        await telegram_app.start()
-        
-        logger.info("Bot started successfully")
-        
-    except Exception as e:
-        logger.error(f"Failed to start bot: {e}")
-        raise
-
 if __name__ == "__main__":
-    asyncio.run(main())
-
-# Рефакторинг завершен - файл теперь управляемый! 
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=10000)
