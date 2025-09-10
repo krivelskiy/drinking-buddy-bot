@@ -1,3 +1,4 @@
+"""
 Утилиты для работы с Катей (напитки, стикеры, подарки)
 """
 import logging
@@ -38,11 +39,24 @@ def can_katya_drink_free(chat_id: int) -> bool:
         try:
             with engine.begin() as conn:
                 conn.execute(text("DROP TABLE IF EXISTS katya_free_drinks"))
-                conn.execute(text("CREATE TABLE katya_free_drinks (chat_id INTEGER PRIMARY KEY, drinks_count INTEGER)"))
-                return True # После пересоздания таблицы первый напиток бесплатный
-        except Exception as re_e:
-            logger.error(f"Error recreating table: {re_e}")
-            return False
+                conn.execute(text("""
+                    CREATE TABLE katya_free_drinks (
+                        id SERIAL PRIMARY KEY,
+                        chat_id BIGINT NOT NULL,
+                        drinks_count INTEGER DEFAULT 0,
+                        last_reset TIMESTAMPTZ DEFAULT NOW(),
+                        created_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                """))
+                # Создаем запись для пользователя
+                conn.execute(
+                    text("INSERT INTO katya_free_drinks (chat_id, drinks_count) VALUES (:chat_id, 0)"),
+                    {"chat_id": chat_id}
+                )
+                return True
+        except Exception as e2:
+            logger.error(f"Error recreating katya_free_drinks table: {e2}")
+            return True  # По умолчанию разрешаем пить
 
 def increment_katya_drinks(chat_id: int) -> None:
     """Увеличить счетчик напитков Кати"""
