@@ -1208,9 +1208,9 @@ async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     recent_messages = get_recent_messages(chat_id, limit=12)
     answer = llm_reply(text_in, user_tg_id, chat_id, recent_messages)
     
-    # Определяем команду стикера на основе ответа
+    # Определяем команду стикера на основе ответа LLM
     sticker_command = None
-    if any(keyword in answer.lower() for keyword in ["выпьем", "выпьемте", "пьем", "пьемте", "выпьем вместе", "давай выпьем"]):
+    if any(keyword in answer.lower() for keyword in ["выпьем", "выпьемте", "пьем", "пьемте", "выпьем вместе", "давай выпьем", "пей", "выпей", "наливай"]):
         sticker_command = "[SEND_DRINK_BEER]"
     elif any(keyword in answer.lower() for keyword in ["водка", "водочка", "водочки"]):
         sticker_command = "[SEND_DRINK_VODKA]"
@@ -2572,11 +2572,11 @@ def reset_quick_message_flag(user_tg_id: int) -> None:
     try:
         with engine.begin() as conn:
             result = conn.execute(
-                text(f"UPDATE {USERS_TABLE} SET quick_message_sent = FALSE WHERE user_tg_id = :tg_id"),
+                text(f"UPDATE {USERS_TABLE} SET quick_message_sent = FALSE, last_quick_message = NOW() WHERE user_tg_id = :tg_id"),
                 {"tg_id": user_tg_id}
             )
             updated_count = result.rowcount
-            logger.info(f"Reset quick_message_sent flag for user {user_tg_id}, rows affected: {updated_count}")
+            logger.info(f"Reset quick_message_sent flag and updated last_quick_message for user {user_tg_id}, rows affected: {updated_count}")
     except Exception as e:
         logger.exception(f"Error resetting quick_message_sent flag for user {user_tg_id}: {e}")
 
