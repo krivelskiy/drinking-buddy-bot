@@ -439,17 +439,6 @@ def increment_katya_drinks(chat_id: int) -> None:
     except Exception as e:
         logger.error(f"Error incrementing drinks: {e}")
 
-async def update_katya_free_drinks(increment: int) -> None:
-    """Обновить счетчик бесплатных напитков Кати"""
-    try:
-        with engine.begin() as conn:
-            conn.execute(
-                text("UPDATE katya_free_drinks SET drinks_count = drinks_count + :increment WHERE chat_id = :chat_id"),
-                {"increment": increment, "chat_id": chat_id}
-            )
-    except Exception as e:
-        logger.error(f"Error updating free drinks: {e}")
-
 # -----------------------------
 # Функции для работы со стикерами
 # -----------------------------
