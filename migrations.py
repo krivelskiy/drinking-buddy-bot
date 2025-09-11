@@ -20,12 +20,24 @@ def add_gender_field():
     except Exception as e:
         logger.error(f"Error adding gender field: {e}")
 
+def add_drinks_count_field():
+    """Добавить поле drinks_count в таблицу katya_free_drinks"""
+    try:
+        with engine.begin() as conn:
+            conn.execute(DDL("ALTER TABLE katya_free_drinks ADD COLUMN IF NOT EXISTS drinks_count INTEGER DEFAULT 0"))
+            logger.info("✅ Added drinks_count field to katya_free_drinks table")
+    except Exception as e:
+        logger.error(f"Error adding drinks_count field: {e}")
+
 def run_migrations():
     """Запустить все миграции"""
     logger.info("🔄 Running database migrations...")
     
     # Добавляем поле gender
     add_gender_field()
+    
+    # Добавляем поле drinks_count
+    add_drinks_count_field()
     
     logger.info("✅ All migrations completed")
 
