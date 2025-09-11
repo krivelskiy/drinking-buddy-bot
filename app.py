@@ -43,6 +43,8 @@ from message_handlers import handle_user_message, handle_successful_payment
 from gender_llm import generate_gender_appropriate_gratitude
 from db_utils import get_user_gender, update_user_gender, update_user_name_and_gender
 from migrations import run_migrations
+from katya_utils import send_gift_request
+from katya_utils import send_gift_request
 
 # Условные импорты функций
 try:
@@ -371,7 +373,7 @@ async def gift_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     chat_id = update.message.chat_id
     
     # Отправляем запрос на подарок
-    await send_gift_request(chat_id, user_tg_id)
+    await send_gift_request(context.bot, chat_id, user_tg_id)
 
 # -----------------------------
 # Основной обработчик сообщений
