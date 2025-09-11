@@ -50,6 +50,18 @@ def get_user_name(user_tg_id: int) -> Optional[str]:
         logger.error(f"Error getting user name: {e}")
         return None
 
+def update_user_name(user_tg_id: int, name: str) -> None:
+    """Обновить только имя пользователя"""
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(f"UPDATE {USERS_TABLE} SET first_name = :name WHERE user_tg_id = :tg_id"),
+                {"name": name, "tg_id": user_tg_id}
+            )
+            logger.info(f"Updated name for user {user_tg_id} to {name}")
+    except Exception as e:
+        logger.error(f"Error updating user name: {e}")
+
 def update_user_name_and_gender(user_tg_id: int, first_name: str) -> None:
     """Обновить имя пользователя и автоматически определить пол через LLM"""
     try:

@@ -106,6 +106,28 @@ def parse_drink_info(text: str) -> Optional[dict]:
     
     return None
 
+def parse_name_from_text(text: str) -> Optional[str]:
+    """Парсинг имени из текста"""
+    text_lower = text.lower()
+    
+    # Паттерны для извлечения имени
+    patterns = [
+        r'меня зовут\s+([а-яё]+)',
+        r'зовут\s+([а-яё]+)',
+        r'имя\s+([а-яё]+)',
+        r'я\s+([а-яё]+)',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, text_lower)
+        if match:
+            name = match.group(1).capitalize()
+            # Проверяем, что это не служебные слова
+            if name not in ['я', 'меня', 'зовут', 'имя', 'как', 'что', 'где', 'когда', 'почему', 'зачем']:
+                return name
+    
+    return None
+
 async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработка сообщения от пользователя"""
     if not update.message or not update.message.text:
@@ -130,6 +152,16 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             if current_name != update.message.from_user.first_name or not current_gender:
                 update_user_name_and_gender(user_tg_id, update.message.from_user.first_name)
         
+        # НОВОЕ: Проверяем на упоминание имени в тексте сообщения
+        name_from_text = parse_name_from_text(text_in)
+        if name_from_text:
+            try:
+                from database import update_user_name
+                update_user_name(user_tg_id, name_from_text)
+                logger.info(f"Updated user {user_tg_id} name to {name_from_text}")
+            except Exception as e:
+                logger.error(f"Failed to update name: {e}")
+        
         # Сбрасываем флаг быстрого сообщения при получении сообщения от пользователя
         reset_quick_message_flag(user_tg_id)
         
@@ -139,6 +171,34 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text(f"📊 **Твоя статистика выпитого:**\n\n{stats}")
             save_message(chat_id, user_tg_id, "assistant", f"📊 **Твоя статистика выпитого:**\n\n{stats}", None, None, None)
             return  # ВАЖНО: return чтобы НЕ вызывать LLM
+        
+        # НОВОЕ: Проверяем на упоминание пола
+        gender_updated = False
+        text_lower = text_in.lower()
+        
+        if any(phrase in text_lower for phrase in [
+            'запомни что я женского пола', 'я женщина', 'я девушка', 'я девочка',
+            'женского пола', 'женщина', 'девушка', 'девочка'
+        ]):
+            try:
+                from database import update_user_gender
+                update_user_gender(user_tg_id, 'female')
+                gender_updated = True
+                logger.info(f"Updated user {user_tg_id} gender to female")
+            except Exception as e:
+                logger.error(f"Failed to update gender to female: {e}")
+        
+        elif any(phrase in text_lower for phrase in [
+            'запомни что я мужского пола', 'я мужчина', 'я парень', 'я мальчик',
+            'мужского пола', 'мужчина', 'парень', 'мальчик'
+        ]):
+            try:
+                from database import update_user_gender
+                update_user_gender(user_tg_id, 'male')
+                gender_updated = True
+                logger.info(f"Updated user {user_tg_id} gender to male")
+            except Exception as e:
+                logger.error(f"Failed to update gender to male: {e}")
         
         # Остальные проверки...
         # 1) Проверяем на упоминание возраста
