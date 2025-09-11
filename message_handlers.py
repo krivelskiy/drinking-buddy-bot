@@ -240,10 +240,16 @@ async def handle_successful_payment(update: Update, context: ContextTypes.DEFAUL
         try:
             import json
             if payment.invoice_payload:
-                payload_data = json.loads(payment.invoice_payload)
-                drink_name = payload_data.get('drink_name', 'напиток')
-                drink_emoji = payload_data.get('drink_emoji', '')
-                logger.info(f"Parsed payload: {payload_data}")
+                # Проверяем, является ли payload JSON или простой строкой
+                if payment.invoice_payload.startswith('{'):
+                    payload_data = json.loads(payment.invoice_payload)
+                    drink_name = payload_data.get('drink_name', 'напиток')
+                    drink_emoji = payload_data.get('drink_emoji', '')
+                else:
+                    # Простая строка типа "gift_виски"
+                    drink_name = "напиток"
+                    drink_emoji = ""
+                logger.info(f"Parsed payload: {payment.invoice_payload}")
             else:
                 logger.warning("Empty invoice_payload")
         except json.JSONDecodeError as e:

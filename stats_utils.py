@@ -93,8 +93,10 @@ def should_remind_about_stats(user_tg_id: int) -> bool:
             ).fetchone()
             
             if result and result[0]:
-                # Проверяем, прошло ли 24 часа
-                return (datetime.now() - result[0]).total_seconds() > 86400
+                # Исправляем проблему с timezone - используем UTC
+                from datetime import timezone
+                now_utc = datetime.now(timezone.utc)
+                return (now_utc - result[0]).total_seconds() > 86400
             else:
                 return True
     except Exception as e:
