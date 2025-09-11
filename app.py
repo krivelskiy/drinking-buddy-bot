@@ -258,12 +258,13 @@ async def startup_event():
         telegram_app.add_handler(PreCheckoutQueryHandler(pre_checkout_callback))
         telegram_app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
         
-        # Запускаем планировщики
+        logger.info("Application started successfully")
+        
+        # Запускаем планировщики с небольшой задержкой
+        await asyncio.sleep(2)  # Даем время на полную инициализацию
         asyncio.create_task(ping_scheduler())
         asyncio.create_task(quick_message_scheduler(bot))
         asyncio.create_task(auto_message_scheduler(bot))
-        
-        logger.info("Application started successfully")
         
     except Exception as e:
         logger.error(f"Failed to start application: {e}")
