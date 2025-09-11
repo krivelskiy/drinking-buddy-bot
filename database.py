@@ -224,6 +224,7 @@ def get_users_for_auto_message() -> List[Dict[str, Any]]:
     """Получить пользователей, которым нужно отправить автоматическое сообщение (24 часа)"""
     with engine.begin() as conn:
         # Новый алгоритм: ищем пользователей, которые написали последнее сообщение более 24 часов назад
+        # И которым не отправляли auto message в последние 24 часа
         query = f"""
             SELECT DISTINCT u.user_tg_id, u.chat_id, u.first_name, u.preferences
             FROM {USERS_TABLE} u
@@ -235,6 +236,7 @@ def get_users_for_auto_message() -> List[Dict[str, Any]]:
             ) m ON u.user_tg_id = m.user_tg_id
             WHERE m.last_user_message_time IS NOT NULL
               AND m.last_user_message_time < NOW() - INTERVAL '24 hours'
+              AND (u.last_auto_message IS NULL OR u.last_auto_message < NOW() - INTERVAL '24 hours')
         """
         
         rows = conn.execute(text(query)).fetchall()

@@ -94,7 +94,7 @@ async def auto_message_scheduler(bot):
         except Exception as e:
             logger.error(f"Error in auto_message_scheduler: {e}")
         
-        await asyncio.sleep(300)  # Проверяем каждые 5 минут
+        await asyncio.sleep(86400)  # Проверяем каждые 24 часа
 
 async def ping_scheduler():
     """Планировщик пингов для поддержания активности"""
