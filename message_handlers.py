@@ -123,7 +123,10 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Обновляем имя пользователя и определяем пол если оно изменилось
     if update.message.from_user.first_name:
         current_name = get_user_name(user_tg_id)
-        if current_name != update.message.from_user.first_name:
+        current_gender = get_user_gender(user_tg_id)
+        
+        # Определяем пол если имя изменилось ИЛИ пол не определен
+        if current_name != update.message.from_user.first_name or not current_gender:
             update_user_name_and_gender(user_tg_id, update.message.from_user.first_name)
     
     # Сбрасываем флаг быстрого сообщения при получении сообщения от пользователя
