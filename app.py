@@ -493,7 +493,7 @@ async def gift_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await query.message.reply_invoice(
             title=f"🎁 Подарок для Кати: {drink['name']}",
             description=f"Катя будет в восторге от этого подарка! 💕",
-            payload=f"gift_{data}",  # Уникальный payload для идентификации
+            payload=data,  # data уже содержит "gift_вино"
             provider_token="",  # Для Telegram Stars не нужен
             currency="XTR",  # Telegram Stars
             prices=[LabeledPrice(f"{drink['name']}", drink['stars'])],

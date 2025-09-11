@@ -261,7 +261,19 @@ async def handle_successful_payment(update: Update, context: ContextTypes.DEFAUL
         
         # Отправляем стикер с выпиванием подарка
         from katya_utils import send_sticker_by_command, update_katya_free_drinks
-        await send_sticker_by_command(context.bot, chat_id, "[SEND_DRINK_BEER]")
+        
+        # Определяем правильную команду стикера на основе payload
+        sticker_command = "[SEND_DRINK_BEER]"  # по умолчанию
+        if "gift_вино" in payment.invoice_payload:
+            sticker_command = "[SEND_DRINK_WINE]"
+        elif "gift_водка" in payment.invoice_payload:
+            sticker_command = "[SEND_DRINK_VODKA]"
+        elif "gift_виски" in payment.invoice_payload:
+            sticker_command = "[SEND_DRINK_WHISKY]"
+        elif "gift_пиво" in payment.invoice_payload:
+            sticker_command = "[SEND_DRINK_BEER]"
+        
+        await send_sticker_by_command(context.bot, chat_id, sticker_command)
         
         # Обновляем счетчик бесплатных напитков
         await update_katya_free_drinks(chat_id, 1)
