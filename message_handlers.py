@@ -18,7 +18,7 @@ from database import (
 )
 from llm_utils import llm_reply
 from gender_llm import generate_gender_appropriate_gratitude
-from db_utils import update_user_name_and_gender
+from db_utils import update_user_name_and_gender, get_user_gender
 from stats_utils import generate_drinks_stats, save_drink_record, should_remind_about_stats, update_stats_reminder
 from katya_utils import can_katya_drink_free, send_sticker_by_command, increment_katya_drinks, send_gift_request
 
@@ -117,109 +117,116 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     logger.info(f"Received message: {text_in} from user {user_tg_id}")
     
-    # Сохраняем сообщение пользователя в базу данных
-    save_message(chat_id, user_tg_id, "user", text_in)
-    
-    # Обновляем имя пользователя и определяем пол если оно изменилось
-    if update.message.from_user.first_name:
-        current_name = get_user_name(user_tg_id)
-        current_gender = get_user_gender(user_tg_id)
-        
-        # Определяем пол если имя изменилось ИЛИ пол не определен
-        if current_name != update.message.from_user.first_name or not current_gender:
-            update_user_name_and_gender(user_tg_id, update.message.from_user.first_name)
-    
-    # Сбрасываем флаг быстрого сообщения при получении сообщения от пользователя
-    reset_quick_message_flag(user_tg_id)
-    
-    # ВАЖНО: Проверяем статистику ПЕРВОЙ!
-    if any(word in text_in.lower() for word in ['статистика', 'сколько выпил', 'сколько пил', 'статистик']):
-        stats = generate_drinks_stats(user_tg_id)
-        await update.message.reply_text(f"📊 **Твоя статистика выпитого:**\n\n{stats}")
-        save_message(chat_id, user_tg_id, "assistant", f"📊 **Твоя статистика выпитого:**\n\n{stats}", None, None, None)
-        return  # ВАЖНО: return чтобы НЕ вызывать LLM
-    
-    # Остальные проверки...
-    # 1) Проверяем на упоминание возраста
-    age = parse_age_from_text(text_in)
-    if age:
-        try:
-            update_user_age(user_tg_id, age)
-            logger.info("Updated user age to %d", age)
-        except Exception:
-            logger.exception("Failed to update age")
-    
-    # 2) Проверяем на упоминание предпочтений в напитках
-    preferences = parse_drink_preferences(text_in)
-    if preferences:
-        try:
-            update_user_preferences(user_tg_id, preferences)
-            logger.info("Updated user preferences to %s", preferences)
-        except Exception:
-            logger.exception("Failed to update preferences")
-    
-    # 3) Проверяем на упоминание выпитого
-    drink_info = parse_drink_info(text_in)
-    if drink_info:
-        try:
-            save_drink_record(user_tg_id, chat_id, drink_info)
-            logger.info("✅ Saved drink record: %s", drink_info)
-        except Exception:
-            logger.exception("Failed to save drink record")
-    
-    # 4) Проверяем, нужно ли напомнить о статистике
-    if should_remind_about_stats(user_tg_id):
-        reminder_msg = "💡 Кстати, я могу вести статистику твоего выпитого! Просто напиши 'статистика' и я покажу сколько ты выпил сегодня и за неделю! 📊\n\nА чтобы я не забывала - каждый раз когда пьешь, просто напиши мне что и сколько! Например: \"выпил 2 пива\" или \"выпил 100г водки\" 🍷"
-        await update.message.reply_text(reminder_msg)
-        save_message(chat_id, user_tg_id, "assistant", reminder_msg, None, None, None)
-        update_stats_reminder(user_tg_id)
-        return
-    
-    # 5) Генерируем ответ через OpenAI
-    from database import get_recent_messages
-    recent_messages = get_recent_messages(chat_id, limit=12)
-    answer = llm_reply(text_in, user_tg_id, chat_id, recent_messages)
-    
-    # Определяем команду стикера на основе ответа LLM
-    sticker_command = None
-    if any(keyword in answer.lower() for keyword in ["выпьем", "выпьемте", "пьем", "пьемте", "выпьем вместе", "давай выпьем", "пей", "выпей", "наливай"]):
-        sticker_command = "[SEND_DRINK_BEER]"
-    elif any(keyword in answer.lower() for keyword in ["водка", "водочка", "водочки"]):
-        sticker_command = "[SEND_DRINK_VODKA]"
-    elif any(keyword in answer.lower() for keyword in ["вино", "винцо", "винца"]):
-        sticker_command = "[SEND_DRINK_WINE]"
-    elif any(keyword in answer.lower() for keyword in ["виски", "вискарь", "вискаря"]):
-        sticker_command = "[SEND_DRINK_WHISKEY]"
-    elif any(keyword in answer.lower() for keyword in ["грустно", "печально", "тоскливо", "грустная"]):
-        sticker_command = "[SEND_SAD_STICKER]"
-    elif any(keyword in answer.lower() for keyword in ["радостно", "весело", "счастливо", "радостная"]):
-        sticker_command = "[SEND_HAPPY_STICKER]"
-
-    # 6) Отправляем ответ
     try:
-        sent_message = await update.message.reply_text(answer)
+        # Сохраняем сообщение пользователя в базу данных
+        save_message(chat_id, user_tg_id, "user", text_in)
         
-        # 7) Проверяем, можем ли отправить стикер (если LLM его определил)
-        if sticker_command:
-            # Проверяем, может ли Катя пить бесплатно
-            if can_katya_drink_free(chat_id):
-                # Отправляем стикер и увеличиваем счетчик
-                await send_sticker_by_command(context.bot, chat_id, sticker_command)
-                increment_katya_drinks(chat_id)
-                
-                # Сохраняем ответ бота С информацией о стикере
-                save_message(chat_id, user_tg_id, "assistant", answer, sent_message.message_id, None, sticker_command)
+        # Обновляем имя пользователя и определяем пол если оно изменилось
+        if update.message.from_user.first_name:
+            current_name = get_user_name(user_tg_id)
+            current_gender = get_user_gender(user_tg_id)
+            
+            # Определяем пол если имя изменилось ИЛИ пол не определен
+            if current_name != update.message.from_user.first_name or not current_gender:
+                update_user_name_and_gender(user_tg_id, update.message.from_user.first_name)
+        
+        # Сбрасываем флаг быстрого сообщения при получении сообщения от пользователя
+        reset_quick_message_flag(user_tg_id)
+        
+        # ВАЖНО: Проверяем статистику ПЕРВОЙ!
+        if any(word in text_in.lower() for word in ['статистика', 'сколько выпил', 'сколько пил', 'статистик']):
+            stats = generate_drinks_stats(user_tg_id)
+            await update.message.reply_text(f"📊 **Твоя статистика выпитого:**\n\n{stats}")
+            save_message(chat_id, user_tg_id, "assistant", f"📊 **Твоя статистика выпитого:**\n\n{stats}", None, None, None)
+            return  # ВАЖНО: return чтобы НЕ вызывать LLM
+        
+        # Остальные проверки...
+        # 1) Проверяем на упоминание возраста
+        age = parse_age_from_text(text_in)
+        if age:
+            try:
+                update_user_age(user_tg_id, age)
+                logger.info("Updated user age to %d", age)
+            except Exception:
+                logger.exception("Failed to update age")
+        
+        # 2) Проверяем на упоминание предпочтений в напитках
+        preferences = parse_drink_preferences(text_in)
+        if preferences:
+            try:
+                update_user_preferences(user_tg_id, preferences)
+                logger.info("Updated user preferences to %s", preferences)
+            except Exception:
+                logger.exception("Failed to update preferences")
+        
+        # 3) Проверяем на упоминание выпитого
+        drink_info = parse_drink_info(text_in)
+        if drink_info:
+            try:
+                save_drink_record(user_tg_id, chat_id, drink_info)
+                logger.info("✅ Saved drink record: %s", drink_info)
+            except Exception:
+                logger.exception("Failed to save drink record")
+        
+        # 4) Проверяем, нужно ли напомнить о статистике
+        if should_remind_about_stats(user_tg_id):
+            reminder_msg = "💡 Кстати, я могу вести статистику твоего выпитого! Просто напиши 'статистика' и я покажу сколько ты выпил сегодня и за неделю! 📊\n\nА чтобы я не забывала - каждый раз когда пьешь, просто напиши мне что и сколько! Например: \"выпил 2 пива\" или \"выпил 100г водки\" 🍷"
+            await update.message.reply_text(reminder_msg)
+            save_message(chat_id, user_tg_id, "assistant", reminder_msg, None, None, None)
+            update_stats_reminder(user_tg_id)
+            return
+        
+        # 5) Генерируем ответ через OpenAI
+        from database import get_recent_messages
+        recent_messages = get_recent_messages(chat_id, limit=12)
+        answer = llm_reply(text_in, user_tg_id, chat_id, recent_messages)
+        
+        # Определяем команду стикера на основе ответа LLM
+        sticker_command = None
+        if any(keyword in answer.lower() for keyword in ["выпьем", "выпьемте", "пьем", "пьемте", "выпьем вместе", "давай выпьем", "пей", "выпей", "наливай"]):
+            sticker_command = "[SEND_DRINK_BEER]"
+        elif any(keyword in answer.lower() for keyword in ["водка", "водочка", "водочки"]):
+            sticker_command = "[SEND_DRINK_VODKA]"
+        elif any(keyword in answer.lower() for keyword in ["вино", "винцо", "винца"]):
+            sticker_command = "[SEND_DRINK_WINE]"
+        elif any(keyword in answer.lower() for keyword in ["виски", "вискарь", "вискаря"]):
+            sticker_command = "[SEND_DRINK_WHISKEY]"
+        elif any(keyword in answer.lower() for keyword in ["грустно", "печально", "тоскливо", "грустная"]):
+            sticker_command = "[SEND_SAD_STICKER]"
+        elif any(keyword in answer.lower() for keyword in ["радостно", "весело", "счастливо", "радостная"]):
+            sticker_command = "[SEND_HAPPY_STICKER]"
+
+        # 6) Отправляем ответ
+        try:
+            sent_message = await update.message.reply_text(answer)
+            
+            # 7) Проверяем, можем ли отправить стикер (если LLM его определил)
+            if sticker_command:
+                # Проверяем, может ли Катя пить бесплатно
+                if can_katya_drink_free(chat_id):
+                    # Отправляем стикер и увеличиваем счетчик
+                    await send_sticker_by_command(context.bot, chat_id, sticker_command)
+                    increment_katya_drinks(chat_id)
+                    
+                    # Сохраняем ответ бота С информацией о стикере
+                    save_message(chat_id, user_tg_id, "assistant", answer, sent_message.message_id, None, sticker_command)
+                else:
+                    # Катя исчерпала лимит бесплатных напитков - НЕ отправляем стикер
+                    await send_gift_request(context.bot, chat_id, user_tg_id)
+                    
+                    # Сохраняем ответ бота БЕЗ стикера
+                    save_message(chat_id, user_tg_id, "assistant", answer, sent_message.message_id)
             else:
-                # Катя исчерпала лимит бесплатных напитков - НЕ отправляем стикер
-                await send_gift_request(context.bot, chat_id, user_tg_id)
-                
-                # Сохраняем ответ бота БЕЗ стикера
+                # Сохраняем ответ бота без стикера
                 save_message(chat_id, user_tg_id, "assistant", answer, sent_message.message_id)
-        else:
-            # Сохраняем ответ бота без стикера
-            save_message(chat_id, user_tg_id, "assistant", answer, sent_message.message_id)
+        except Exception as e:
+            logger.exception(f"Message handler error: {e}")
     except Exception as e:
-        logger.exception(f"Message handler error: {e}")
+        logger.error(f"Error in handle_user_message: {e}")
+        # Катя всегда должна отвечать, даже при ошибках
+        fallback_message = "Извини, у меня что-то сломалось... Но я все равно готова выпить с тобой! 🍻"
+        await update.message.reply_text(fallback_message)
+        save_message(chat_id, user_tg_id, "assistant", fallback_message, None, None, None)
 
 async def handle_successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка успешной оплаты"""
@@ -257,7 +264,6 @@ async def handle_successful_payment(update: Update, context: ContextTypes.DEFAUL
             # Используем значения по умолчанию
         
         # Генерируем благодарственные сообщения с учетом пола
-        from db_utils import get_user_name, get_user_gender
         user_name = get_user_name(user_tg_id) or "друг"
         user_gender = get_user_gender(user_tg_id) or "neutral"
         
