@@ -262,3 +262,19 @@ def update_last_auto_message(user_tg_id: int) -> None:
             logger.info(f"Updated last_auto_message and set quick_message_sent=FALSE for user {user_tg_id}, rows affected: {updated_count}")
     except Exception as e:
         logger.error(f"Error updating last_auto_message for user {user_tg_id}: {e}") 
+
+def get_user_preferences(user_tg_id: int) -> Optional[str]:
+    """Получить предпочтения пользователя"""
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(
+                text(f"SELECT preferences FROM {USERS_TABLE} WHERE user_tg_id = :tg_id"),
+                {"tg_id": user_tg_id}
+            )
+            row = result.fetchone()
+            if row and row[0]:
+                return row[0]
+            return None
+    except Exception as e:
+        logger.error(f"Error getting user preferences: {e}")
+        return None 
