@@ -91,6 +91,8 @@ async def send_sticker_by_command(bot, chat_id: int, command: str) -> None:
             "[SEND_DRINK_BEER]": STICKERS["DRINK_BEER"],
             "[SEND_KATYA_HAPPY]": STICKERS["KATYA_HAPPY"],
             "[SEND_KATYA_SAD]": STICKERS["KATYA_SAD"],
+            "[SEND_SAD_STICKER]": STICKERS["KATYA_SAD"],  # Добавляем маппинг для грустного стикера
+            "[SEND_HAPPY_STICKER]": STICKERS["KATYA_HAPPY"],  # Добавляем маппинг для веселого стикера
         }
         
         if command in command_mapping:

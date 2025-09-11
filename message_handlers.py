@@ -241,9 +241,17 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         recent_messages = get_recent_messages(chat_id, limit=12)
         answer = llm_reply(text_in, user_tg_id, chat_id, recent_messages)
         
-        # Определяем команду стикера на основе ответа LLM
+        # Определяем команду стикера на основе ответа LLM И сообщения пользователя
         sticker_command = None
-        if any(keyword in answer.lower() for keyword in ["выпьем", "выпьемте", "пьем", "пьемте", "выпьем вместе", "давай выпьем", "пей", "выпей", "наливай"]):
+        
+        # Проверяем сообщение пользователя на эмоциональные слова
+        user_text_lower = text_in.lower()
+        if any(keyword in user_text_lower for keyword in ["грустно", "печально", "тоскливо", "грустная", "грустный", "печальный", "тоскливый", "депрессия", "уныние", "плохо", "плохое настроение"]):
+            sticker_command = "[SEND_SAD_STICKER]"
+        elif any(keyword in user_text_lower for keyword in ["радостно", "весело", "счастливо", "радостная", "радостный", "веселая", "веселый", "счастливая", "счастливый", "отлично", "прекрасно", "замечательно", "хорошее настроение"]):
+            sticker_command = "[SEND_HAPPY_STICKER]"
+        # Если пользователь не выразил эмоции, проверяем ответ LLM
+        elif any(keyword in answer.lower() for keyword in ["выпьем", "выпьемте", "пьем", "пьемте", "выпьем вместе", "давай выпьем", "пей", "выпей", "наливай"]):
             sticker_command = "[SEND_DRINK_BEER]"
         elif any(keyword in answer.lower() for keyword in ["водка", "водочка", "водочки"]):
             sticker_command = "[SEND_DRINK_VODKA]"
