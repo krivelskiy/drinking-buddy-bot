@@ -246,9 +246,9 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         # Проверяем сообщение пользователя на эмоциональные слова
         user_text_lower = text_in.lower()
-        if any(keyword in user_text_lower for keyword in ["грустно", "печально", "тоскливо", "грустная", "грустный", "печальный", "тоскливый", "депрессия", "уныние", "плохо", "плохое настроение"]):
+        if any(keyword in user_text_lower for keyword in ["грустно", "печально", "тоскливо", "грустная", "грустный", "печальный", "тоскливый", "депрессия", "уныние", "плохо", "плохое настроение", "грусть", "печаль", "грустный повод", "печальная история"]):
             sticker_command = "[SEND_SAD_STICKER]"
-        elif any(keyword in user_text_lower for keyword in ["радостно", "весело", "счастливо", "радостная", "радостный", "веселая", "веселый", "счастливая", "счастливый", "отлично", "прекрасно", "замечательно", "хорошее настроение"]):
+        elif any(keyword in user_text_lower for keyword in ["радостно", "весело", "счастливо", "радостная", "радостный", "веселая", "веселый", "счастливая", "счастливый", "отлично", "прекрасно", "замечательно", "хорошее настроение", "радость", "веселье", "улыбнись", "улыбка"]):
             sticker_command = "[SEND_HAPPY_STICKER]"
         # Если пользователь не выразил эмоции, проверяем ответ LLM
         elif any(keyword in answer.lower() for keyword in ["выпьем", "выпьемте", "пьем", "пьемте", "выпьем вместе", "давай выпьем", "пей", "выпей", "наливай"]):
@@ -270,20 +270,28 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             
             # 7) Проверяем, можем ли отправить стикер (если LLM его определил)
             if sticker_command:
-                # Проверяем, может ли Катя пить бесплатно
-                if can_katya_drink_free(chat_id):
-                    # Отправляем стикер и увеличиваем счетчик
+                # Эмоциональные стикеры отправляем всегда, независимо от лимита
+                if sticker_command in ["[SEND_SAD_STICKER]", "[SEND_HAPPY_STICKER]"]:
+                    # Отправляем эмоциональный стикер
                     await send_sticker_by_command(context.bot, chat_id, sticker_command)
-                    increment_katya_drinks(chat_id)
                     
                     # Сохраняем ответ бота С информацией о стикере
                     save_message(chat_id, user_tg_id, "assistant", answer, sent_message.message_id, None, sticker_command)
                 else:
-                    # Катя исчерпала лимит бесплатных напитков - НЕ отправляем стикер
-                    await send_gift_request(context.bot, chat_id, user_tg_id)
-                    
-                    # Сохраняем ответ бота БЕЗ стикера
-                    save_message(chat_id, user_tg_id, "assistant", answer, sent_message.message_id)
+                    # Для стикеров с напитками проверяем лимит
+                    if can_katya_drink_free(chat_id):
+                        # Отправляем стикер и увеличиваем счетчик
+                        await send_sticker_by_command(context.bot, chat_id, sticker_command)
+                        increment_katya_drinks(chat_id)
+                        
+                        # Сохраняем ответ бота С информацией о стикере
+                        save_message(chat_id, user_tg_id, "assistant", answer, sent_message.message_id, None, sticker_command)
+                    else:
+                        # Катя исчерпала лимит бесплатных напитков - НЕ отправляем стикер
+                        await send_gift_request(context.bot, chat_id, user_tg_id)
+                        
+                        # Сохраняем ответ бота БЕЗ стикера
+                        save_message(chat_id, user_tg_id, "assistant", answer, sent_message.message_id)
             else:
                 # Сохраняем ответ бота без стикера
                 save_message(chat_id, user_tg_id, "assistant", answer, sent_message.message_id)
