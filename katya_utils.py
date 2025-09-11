@@ -83,7 +83,21 @@ async def update_katya_free_drinks(chat_id: int, increment: int) -> None:
 async def send_sticker_by_command(bot, chat_id: int, command: str) -> None:
     """Отправить стикер по команде"""
     try:
-        if command in STICKERS:
+        # Маппинг команд на стикеры
+        command_mapping = {
+            "[SEND_DRINK_VODKA]": STICKERS["DRINK_VODKA"],
+            "[SEND_DRINK_WHISKY]": STICKERS["DRINK_WHISKY"],
+            "[SEND_DRINK_WINE]": STICKERS["DRINK_WINE"],
+            "[SEND_DRINK_BEER]": STICKERS["DRINK_BEER"],
+            "[SEND_KATYA_HAPPY]": STICKERS["KATYA_HAPPY"],
+            "[SEND_KATYA_SAD]": STICKERS["KATYA_SAD"],
+        }
+        
+        if command in command_mapping:
+            sticker_id = command_mapping[command]
+            await bot.send_sticker(chat_id=chat_id, sticker=sticker_id)
+            logger.info(f"Sent sticker {command} to chat {chat_id}")
+        elif command in STICKERS:
             sticker_id = STICKERS[command]
             await bot.send_sticker(chat_id=chat_id, sticker=sticker_id)
             logger.info(f"Sent sticker {command} to chat {chat_id}")
