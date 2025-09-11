@@ -44,7 +44,6 @@ from gender_llm import generate_gender_appropriate_gratitude
 from db_utils import get_user_gender, update_user_gender, update_user_name_and_gender
 from migrations import run_migrations
 from katya_utils import send_gift_request
-from katya_utils import send_gift_request
 
 # Условные импорты функций
 try:
