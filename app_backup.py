@@ -43,8 +43,6 @@ from message_handlers import handle_user_message, handle_successful_payment
 from gender_llm import generate_gender_appropriate_gratitude
 from db_utils import get_user_gender, update_user_gender, update_user_name_and_gender
 from migrations import run_migrations
-from katya_utils import send_gift_request
-from katya_utils import send_gift_request
 
 # Условные импорты функций
 try:
@@ -254,7 +252,6 @@ async def startup_event():
         telegram_app.add_handler(CommandHandler("help", help_command))
         telegram_app.add_handler(CommandHandler("stats", stats_command))
         telegram_app.add_handler(CommandHandler("gift", gift_command))
-        telegram_app.add_handler(CallbackQueryHandler(gift_callback, pattern="^gift_"))
         telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_handler))
         telegram_app.add_handler(PreCheckoutQueryHandler(pre_checkout_callback))
         telegram_app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
@@ -374,7 +371,7 @@ async def gift_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     chat_id = update.message.chat_id
     
     # Отправляем запрос на подарок
-    await send_gift_request(context.bot, chat_id, user_tg_id)
+    await send_gift_request(chat_id, user_tg_id)
 
 # -----------------------------
 # Основной обработчик сообщений
@@ -462,48 +459,40 @@ async def send_sticker_by_command(chat_id: int, command: str) -> None:
 # Функции для работы с подарками
 # -----------------------------
 
-async def gift_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработчик нажатий на кнопки подарков"""
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = query.from_user.id
-    data = query.data
-    
-    logger.info(f"Gift callback from user {user_id}: {data}")
-    
-    # Информация о напитках
-    drink_info = {
-        "gift_вино": {"name": "🍷 Вино", "stars": 1, "sticker": "[SEND_DRINK_WINE]"},
-        "gift_водка": {"name": "🍸 Водка", "stars": 1, "sticker": "[SEND_DRINK_VODKA]"},
-        "gift_виски": {"name": "🥃 Виски", "stars": 1, "sticker": "[SEND_DRINK_WHISKY]"},
-        "gift_пиво": {"name": "🍺 Пиво", "stars": 1, "sticker": "[SEND_DRINK_BEER]"}
-    }
-    
-    if data not in drink_info:
-        await query.edit_message_text("❌ Неизвестный напиток")
-        return
-    
-    drink = drink_info[data]
-    
-    # Создаем ПЛАТЕЖНОЕ сообщение через send_invoice
-    from telegram import LabeledPrice
-    
+async def send_gift_request(chat_id: int, user_tg_id: int) -> None:
+    """Отправить запрос на подарок"""
     try:
-        await query.message.reply_invoice(
-            title=f"🎁 Подарок для Кати: {drink['name']}",
-            description=f"Катя будет в восторге от этого подарка! 💕",
-            payload=f"gift_{data}",  # Уникальный payload для идентификации
-            provider_token="",  # Для Telegram Stars не нужен
+        # Список доступных напитков с ценами (временно все по 1 звезде)
+        drinks = [
+            {"name": "Пиво", "emoji": "🍺", "price": 1},
+            {"name": "Водка", "emoji": "🍸", "price": 1},
+            {"name": "Вино", "emoji": "🍷", "price": 1},
+            {"name": "Виски", "emoji": "🥃", "price": 1},
+            {"name": "Шампанское", "emoji": "🍾", "price": 1},
+        ]
+        
+        # Выбираем случайный напиток
+        drink = random.choice(drinks)
+        
+        # Создаем payload для платежа
+        payload = json.dumps({
+            "drink_name": drink["name"],
+            "drink_emoji": drink["emoji"]
+        })
+        
+        # Отправляем invoice
+        await bot.send_invoice(
+            chat_id=chat_id,
+            title=f"Подарок для Кати: {drink['name']} {drink['emoji']}",
+            description=f"Подари Кате {drink['name'].lower()}! Она будет очень рада! 💕",
+            payload=payload,
+            provider_token="",  # Для тестовых платежей
             currency="XTR",  # Telegram Stars
-            prices=[LabeledPrice(f"{drink['name']}", drink['stars'])],
+            prices=[{"label": f"{drink['name']} {drink['emoji']}", "amount": drink["price"]}]
         )
         
-        logger.info(f"Sent invoice for {drink['name']} to user {user_id}")
-        
     except Exception as e:
-        logger.error(f"Error sending invoice: {e}")
-        await query.edit_message_text("❌ Ошибка при создании платежа")
+        logger.error(f"Error sending gift request: {e}")
 
 # -----------------------------
 # Функции для работы со статистикой
