@@ -93,16 +93,16 @@ async def send_sticker_by_command(bot, chat_id: int, command: str) -> None:
         logger.error(f"Error sending sticker {command}: {e}")
 
 async def send_gift_request(bot, chat_id: int, user_tg_id: int) -> None:
-    """Отправить запрос на подарок"""
+    """Отправить запрос на подарок с inline кнопками для выбора напитка"""
     try:
-        # Получаем информацию о пользователе для персонализации
         from database import get_user_name
         from db_utils import get_user_gender
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
         
         user_name = get_user_name(user_tg_id) or "друг"
         user_gender = get_user_gender(user_tg_id) or "неизвестен"
         
-        # Оригинальный список доступных напитков с ценами (временно все по 1 звезде)
+        # Список доступных напитков
         drinks = [
             {"name": "Вино", "emoji": "🍷", "price": 1},
             {"name": "Водка", "emoji": "🍸", "price": 1},
@@ -110,19 +110,16 @@ async def send_gift_request(bot, chat_id: int, user_tg_id: int) -> None:
             {"name": "Пиво", "emoji": "🍺", "price": 1},
         ]
         
-        # Создаем список цен для всех напитков
-        prices = []
+        # Создаем inline кнопки для каждого напитка
+        keyboard = []
         for drink in drinks:
-            prices.append({
-                "label": f"{drink['name']} {drink['emoji']}",
-                "amount": drink["price"]
-            })
+            button = InlineKeyboardButton(
+                f"{drink['name']} {drink['emoji']} - {drink['price']} ⭐",
+                callback_data=f"gift_{drink['name'].lower()}"
+            )
+            keyboard.append([button])
         
-        # Создаем payload для платежа (общий для всех напитков)
-        payload = json.dumps({
-            "drink_name": "напиток",
-            "drink_emoji": "🍹"
-        })
+        reply_markup = InlineKeyboardMarkup(keyboard)
         
         # Более тонкие и естественные описания
         descriptions = [
@@ -135,20 +132,14 @@ async def send_gift_request(bot, chat_id: int, user_tg_id: int) -> None:
         
         description = random.choice(descriptions)
         
-        logger.info(f"Sending gift request with {len(prices)} drinks: {[p['label'] for p in prices]}")
+        logger.info(f"Sending gift request with inline buttons for {len(drinks)} drinks")
         
-        # Отправляем invoice с общим списком напитков
-        await bot.send_invoice(
+        # Отправляем сообщение с inline кнопками
+        await bot.send_message(
             chat_id=chat_id,
-            title="Угости Катю напитком 🍹",
-            description=description,
-            payload=payload,
-            provider_token="",  # Для тестовых платежей
-            currency="XTR",  # Telegram Stars
-            prices=prices
+            text=f"{description}\n\nВыбери напиток для Кати:",
+            reply_markup=reply_markup
         )
-        
-        logger.info(f"Successfully sent gift request to user {user_tg_id}")
         
     except Exception as e:
         logger.error(f"Error sending gift request: {e}") 
