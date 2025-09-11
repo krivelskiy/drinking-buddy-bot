@@ -474,10 +474,10 @@ async def gift_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     
     # Информация о напитках
     drink_info = {
-        "gift_вино": {"name": "🍷 Вино", "stars": 1, "sticker": "[SEND_DRINK_WINE]"},
-        "gift_водка": {"name": "🍸 Водка", "stars": 1, "sticker": "[SEND_DRINK_VODKA]"},
-        "gift_виски": {"name": "🥃 Виски", "stars": 1, "sticker": "[SEND_DRINK_WHISKY]"},
-        "gift_пиво": {"name": "🍺 Пиво", "stars": 1, "sticker": "[SEND_DRINK_BEER]"}
+        "gift_вино": {"name": "🍷 Вино", "stars": 250, "sticker": "[SEND_DRINK_WINE]"},
+        "gift_водка": {"name": "🍸 Водка", "stars": 100, "sticker": "[SEND_DRINK_VODKA]"},
+        "gift_виски": {"name": "🥃 Виски", "stars": 500, "sticker": "[SEND_DRINK_WHISKEY]"},
+        "gift_пиво": {"name": "🍺 Пиво", "stars": 50, "sticker": "[SEND_DRINK_BEER]"}
     }
     
     if data not in drink_info:
