@@ -156,7 +156,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         name_from_text = parse_name_from_text(text_in)
         if name_from_text:
             try:
-                from database import update_user_name
+                from db_utils import update_user_name
                 update_user_name(user_tg_id, name_from_text)
                 logger.info(f"Updated user {user_tg_id} name to {name_from_text}")
             except Exception as e:
@@ -181,7 +181,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             'женского пола', 'женщина', 'девушка', 'девочка'
         ]):
             try:
-                from database import update_user_gender
+                from db_utils import update_user_gender
                 update_user_gender(user_tg_id, 'female')
                 gender_updated = True
                 logger.info(f"Updated user {user_tg_id} gender to female")
@@ -193,7 +193,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             'мужского пола', 'мужчина', 'парень', 'мальчик'
         ]):
             try:
-                from database import update_user_gender
+                from db_utils import update_user_gender
                 update_user_gender(user_tg_id, 'male')
                 gender_updated = True
                 logger.info(f"Updated user {user_tg_id} gender to male")
