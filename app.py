@@ -459,41 +459,6 @@ async def send_sticker_by_command(chat_id: int, command: str) -> None:
 # Функции для работы с подарками
 # -----------------------------
 
-async def send_gift_request(chat_id: int, user_tg_id: int) -> None:
-    """Отправить запрос на подарок"""
-    try:
-        # Список доступных напитков с ценами (временно все по 1 звезде)
-        drinks = [
-            {"name": "Пиво", "emoji": "🍺", "price": 1},
-            {"name": "Водка", "emoji": "🍸", "price": 1},
-            {"name": "Вино", "emoji": "🍷", "price": 1},
-            {"name": "Виски", "emoji": "🥃", "price": 1},
-            {"name": "Шампанское", "emoji": "🍾", "price": 1},
-        ]
-        
-        # Выбираем случайный напиток
-        drink = random.choice(drinks)
-        
-        # Создаем payload для платежа
-        payload = json.dumps({
-            "drink_name": drink["name"],
-            "drink_emoji": drink["emoji"]
-        })
-        
-        # Отправляем invoice
-        await bot.send_invoice(
-            chat_id=chat_id,
-            title=f"Подарок для Кати: {drink['name']} {drink['emoji']}",
-            description=f"Подари Кате {drink['name'].lower()}! Она будет очень рада! 💕",
-            payload=payload,
-            provider_token="",  # Для тестовых платежей
-            currency="XTR",  # Telegram Stars
-            prices=[{"label": f"{drink['name']} {drink['emoji']}", "amount": drink["price"]}]
-        )
-        
-    except Exception as e:
-        logger.error(f"Error sending gift request: {e}")
-
 # -----------------------------
 # Функции для работы со статистикой
 # -----------------------------
