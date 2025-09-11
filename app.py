@@ -627,6 +627,7 @@ def generate_gender_appropriate_greeting(name: str, gender: Optional[str] = None
 # -----------------------------
 
 @app.get("/")
+@app.head("/")
 async def root():
     """Корневой endpoint"""
     return {
@@ -642,9 +643,16 @@ async def root():
     }
 
 @app.get("/health")
+@app.head("/health")
 async def health_check():
     """Проверка здоровья приложения"""
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+
+@app.get("/ping")
+@app.head("/ping")
+async def ping():
+    """Простой ping endpoint для health checks"""
+    return {"status": "ok"}
 
 @app.get("/metrics")
 async def get_metrics():
