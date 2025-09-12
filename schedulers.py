@@ -109,8 +109,8 @@ async def ping_scheduler():
                 if response.status_code == 200:
                     logger.info("🏓 Ping successful - Render kept alive!")
                 else:
-                    logger.warning(f"🏓 Ping failed with status {response.status_code}")
+                    logger.warning(f"🏓 Ping failed with status {response.status_code}, response: {response.text[:100]}")
         except Exception as e:
             logger.error(f"Error in ping_scheduler: {e}")
         
-        await asyncio.sleep(1800)  # Пинг каждые 30 минут (1800 секунд) 
+        await asyncio.sleep(3600)  # Пинг каждые 60 минут (3600 секунд) 
