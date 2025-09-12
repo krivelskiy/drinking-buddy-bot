@@ -72,10 +72,15 @@ def llm_reply(text_in: str, user_tg_id: int, chat_id: int, recent_messages: List
         
         messages.append({"role": "system", "content": user_info})
         
-        # Добавляем контекст сообщений
-        messages.extend(context_messages)
+        # Добавляем контекст как системное сообщение с пометкой
+        if context_messages:
+            context_text = "Контекст предыдущих сообщений:\n"
+            for msg in context_messages:
+                role_name = "Пользователь" if msg["role"] == "user" else "Катя"
+                context_text += f"{role_name}: {msg['content']}\n"
+            messages.append({"role": "system", "content": context_text})
         
-        # Добавляем текущее сообщение пользователя
+        # Добавляем текущее сообщение пользователя как основное
         messages.append({"role": "user", "content": text_in})
         
         # Отправляем запрос к LLM
