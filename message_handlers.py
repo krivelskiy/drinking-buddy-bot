@@ -188,7 +188,7 @@ def parse_name_from_text(text: str) -> Optional[str]:
     """Парсинг имени из текста"""
     text_lower = text.lower()
     
-    # Исключаем вопросы
+    # Исключаем вопросы и команды
     question_patterns = [
         r'как\s+меня\s+зовут',
         r'как\s+тебя\s+зовут',
@@ -200,11 +200,16 @@ def parse_name_from_text(text: str) -> Optional[str]:
         r'какого\s+ты\s+пола',
         r'какой\s+у\s+тебя\s+пол',
         r'какой\s+у\s+меня\s+пол',
-        r'как\s+тебя\s+зовут',
-        r'как\s+меня\s+зовут'
+        r'запомни\s+что\s+я\s+женского\s+пола',
+        r'запомни\s+что\s+я\s+мужского\s+пола',
+        r'запомни\s+что\s+мой\s+пол',
+        r'я\s+женского\s+пола',
+        r'я\s+мужского\s+пола',
+        r'мой\s+пол\s+женский',
+        r'мой\s+пол\s+мужской'
     ]
     
-    # Проверяем, не является ли сообщение вопросом
+    # Проверяем, не является ли сообщение вопросом или командой
     for pattern in question_patterns:
         if re.search(pattern, text_lower):
             return None
@@ -222,7 +227,7 @@ def parse_name_from_text(text: str) -> Optional[str]:
         if match:
             name = match.group(1).capitalize()
             # Проверяем, что это не служебные слова
-            if name not in ['я', 'меня', 'зовут', 'имя', 'как', 'что', 'где', 'когда', 'почему', 'зачем', 'пола', 'пол', 'какого', 'какой']:
+            if name not in ['я', 'меня', 'зовут', 'имя', 'как', 'что', 'где', 'когда', 'почему', 'зачем', 'пола', 'пол', 'какого', 'какой', 'женского', 'мужского', 'женский', 'мужской']:
                 return name
     
     return None
@@ -247,9 +252,13 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             current_name = get_user_name(user_tg_id)
             current_gender = get_user_gender(user_tg_id)
             
-            # Определяем пол если имя изменилось ИЛИ пол не определен
-            if current_name != update.message.from_user.first_name or not current_gender:
+            # Определяем пол только если имя изменилось И пол не определен
+            if current_name != update.message.from_user.first_name and not current_gender:
                 update_user_name_and_gender(user_tg_id, update.message.from_user.first_name)
+            elif current_name != update.message.from_user.first_name:
+                # Если имя изменилось, но пол уже определен, обновляем только имя
+                from db_utils import update_user_name
+                update_user_name(user_tg_id, update.message.from_user.first_name)
         
         # НОВОЕ: Проверяем на упоминание имени в тексте сообщения
         name_from_text = parse_name_from_text(text_in)
