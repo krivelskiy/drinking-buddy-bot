@@ -63,12 +63,19 @@ def update_user_name(user_tg_id: int, name: str) -> None:
         logger.error(f"Error updating user name: {e}")
 
 def update_user_name_and_gender(user_tg_id: int, first_name: str) -> None:
-    """Обновить имя пользователя и автоматически определить пол через LLM"""
+    """Обновить имя пользователя и автоматически определить пол через LLM (только если пол не определен)"""
     try:
         from gender_llm import detect_gender_with_llm
         
-        # Определяем пол по имени через LLM
-        gender = detect_gender_with_llm(first_name)
+        # Получаем текущий пол пользователя
+        current_gender = get_user_gender(user_tg_id)
+        
+        # Определяем пол по имени через LLM только если пол не определен или равен neutral
+        if not current_gender or current_gender == "neutral":
+            gender = detect_gender_with_llm(first_name)
+        else:
+            # Если пол уже определен, сохраняем его
+            gender = current_gender
         
         with engine.begin() as conn:
             conn.execute(
