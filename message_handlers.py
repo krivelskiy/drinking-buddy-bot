@@ -188,9 +188,24 @@ def parse_name_from_text(text: str) -> Optional[str]:
     """Парсинг имени из текста"""
     text_lower = text.lower()
     
+    # Исключаем вопросы
+    question_patterns = [
+        r'как\s+меня\s+зовут',
+        r'как\s+тебя\s+зовут',
+        r'какое\s+у\s+тебя\s+имя',
+        r'какое\s+у\s+меня\s+имя',
+        r'как\s+тебя\s+зовут',
+        r'как\s+меня\s+зовут'
+    ]
+    
+    # Проверяем, не является ли сообщение вопросом
+    for pattern in question_patterns:
+        if re.search(pattern, text_lower):
+            return None
+    
     # Паттерны для извлечения имени
     patterns = [
-        r'меня зовут\s+([а-яё]+)',
+        r'меня\s+зовут\s+([а-яё]+)',
         r'зовут\s+([а-яё]+)',
         r'имя\s+([а-яё]+)',
         r'я\s+([а-яё]+)',
