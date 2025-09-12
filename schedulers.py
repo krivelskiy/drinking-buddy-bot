@@ -113,4 +113,4 @@ async def ping_scheduler():
         except Exception as e:
             logger.error(f"Error in ping_scheduler: {e}")
         
-        await asyncio.sleep(3600)  # Пинг каждые 60 минут (3600 секунд) 
+        await asyncio.sleep(600)   # Пинг каждые 10 минут (600 секунд) 
