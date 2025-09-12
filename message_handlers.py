@@ -56,29 +56,29 @@ def parse_drink_preferences(text: str) -> Optional[str]:
 
 def parse_drink_info(text: str) -> Optional[dict]:
     """Парсинг информации о выпитом из текста"""
-    # Паттерны для поиска информации о выпитом
-    patterns = [
-        r'выпил\s+(\d+)\s*(?:г|грамм|мл|литр|л|стакан|стакана|стаканов|банка|банки|банок|бутылка|бутылки|бутылок|рюмка|рюмки|рюмок)',
-        r'выпила\s+(\d+)\s*(?:г|грамм|мл|литр|л|стакан|стакана|стаканов|банка|банки|банок|бутылка|бутылки|бутылок|рюмка|рюмки|рюмок)',
-        r'(\d+)\s*(?:г|грамм|мл|литр|л|стакан|стакана|стаканов|банка|банки|банок|бутылка|бутылки|бутылок|рюмка|рюмки|рюмок)',
-    ]
-    
     text_lower = text.lower()
     
-    for pattern in patterns:
+    # Сначала проверяем паттерны с числами
+    patterns_with_numbers = [
+        r'выпил\s+(\d+)\s*(?:г|грамм|мл|литр|л|стакан|стакана|стаканов|банка|банки|банок|бутылка|бутылки|бутылок|бутылку|бутылкой|рюмка|рюмки|рюмок|рюмку|рюмкой|пинта|пинты|пинт)',
+        r'выпила\s+(\d+)\s*(?:г|грамм|мл|литр|л|стакан|стакана|стаканов|банка|банки|банок|бутылка|бутылки|бутылок|бутылку|бутылкой|рюмка|рюмки|рюмок|рюмку|рюмкой|пинта|пинты|пинт)',
+        r'(\d+)\s*(?:г|грамм|мл|литр|л|стакан|стакана|стаканов|банка|банки|банок|бутылка|бутылки|бутылок|бутылку|бутылкой|рюмка|рюмки|рюмок|рюмку|рюмкой|пинта|пинты|пинт)',
+    ]
+    
+    for pattern in patterns_with_numbers:
         match = re.search(pattern, text_lower)
         if match:
             amount = int(match.group(1))
             
             # Определяем тип напитка
             drink_type = "алкоголь"
-            if any(word in text_lower for word in ['пиво', 'beer']):
+            if any(word in text_lower for word in ['пиво', 'пива', 'пивом', 'beer']):
                 drink_type = "пиво"
-            elif any(word in text_lower for word in ['водка', 'vodka']):
+            elif any(word in text_lower for word in ['водка', 'водки', 'водкой', 'vodka']):
                 drink_type = "водка"
-            elif any(word in text_lower for word in ['вино', 'wine']):
+            elif any(word in text_lower for word in ['вино', 'вина', 'вином', 'wine']):
                 drink_type = "вино"
-            elif any(word in text_lower for word in ['виски', 'whisky']):
+            elif any(word in text_lower for word in ['виски', 'виска', 'виском', 'whisky']):
                 drink_type = "виски"
             
             # Определяем единицу измерения
@@ -89,14 +89,59 @@ def parse_drink_info(text: str) -> Optional[dict]:
                 unit = "мл"
             elif any(word in text_lower for word in ['литр', 'л']):
                 unit = "л"
-            elif any(word in text_lower for word in ['стакан', 'стакана', 'стаканов']):
+            elif any(word in text_lower for word in ['стакан', 'стакана', 'стаканов', 'стакан', 'стаканом']):
                 unit = "стаканов"
-            elif any(word in text_lower for word in ['банка', 'банки', 'банок']):
+            elif any(word in text_lower for word in ['банка', 'банки', 'банок', 'банку', 'банкой']):
                 unit = "банок"
-            elif any(word in text_lower for word in ['бутылка', 'бутылки', 'бутылок']):
+            elif any(word in text_lower for word in ['бутылка', 'бутылки', 'бутылок', 'бутылку', 'бутылкой']):
                 unit = "бутылок"
-            elif any(word in text_lower for word in ['рюмка', 'рюмки', 'рюмок']):
+            elif any(word in text_lower for word in ['рюмка', 'рюмки', 'рюмок', 'рюмку', 'рюмкой']):
                 unit = "рюмок"
+            elif any(word in text_lower for word in ['пинта', 'пинты', 'пинт']):
+                unit = "пинт"
+            
+            return {
+                "drink_type": drink_type,
+                "amount": amount,
+                "unit": unit
+            }
+    
+    # Теперь проверяем паттерны без чисел (например, "выпил бокал пива")
+    patterns_without_numbers = [
+        r'выпил\s+(?:стакан|стакана|стаканов|стакан|стаканом|банка|банки|банок|банку|банкой|бутылка|бутылки|бутылок|бутылку|бутылкой|рюмка|рюмки|рюмок|рюмку|рюмкой|бокал|бокала|бокалов|бокал|бокалом|пинта|пинты|пинт)',
+        r'выпила\s+(?:стакан|стакана|стаканов|стакан|стаканом|банка|банки|банок|банку|банкой|бутылка|бутылки|бутылок|бутылку|бутылкой|рюмка|рюмки|рюмок|рюмку|рюмкой|бокал|бокала|бокалов|бокал|бокалом|пинта|пинты|пинт)',
+    ]
+    
+    for pattern in patterns_without_numbers:
+        match = re.search(pattern, text_lower)
+        if match:
+            amount = 1  # По умолчанию 1 порция
+            
+            # Определяем тип напитка
+            drink_type = "алкоголь"
+            if any(word in text_lower for word in ['пиво', 'пива', 'пивом', 'beer']):
+                drink_type = "пиво"
+            elif any(word in text_lower for word in ['водка', 'водки', 'водкой', 'vodka']):
+                drink_type = "водка"
+            elif any(word in text_lower for word in ['вино', 'вина', 'вином', 'wine']):
+                drink_type = "вино"
+            elif any(word in text_lower for word in ['виски', 'виска', 'виском', 'whisky']):
+                drink_type = "виски"
+            
+            # Определяем единицу измерения
+            unit = "порций"
+            if any(word in text_lower for word in ['стакан', 'стакана', 'стаканов', 'стакан', 'стаканом']):
+                unit = "стаканов"
+            elif any(word in text_lower for word in ['банка', 'банки', 'банок', 'банку', 'банкой']):
+                unit = "банок"
+            elif any(word in text_lower for word in ['бутылка', 'бутылки', 'бутылок', 'бутылку', 'бутылкой']):
+                unit = "бутылок"
+            elif any(word in text_lower for word in ['рюмка', 'рюмки', 'рюмок', 'рюмку', 'рюмкой']):
+                unit = "рюмок"
+            elif any(word in text_lower for word in ['бокал', 'бокала', 'бокалов', 'бокал', 'бокалом']):
+                unit = "бокалов"
+            elif any(word in text_lower for word in ['пинта', 'пинты', 'пинт']):
+                unit = "пинт"
             
             return {
                 "drink_type": drink_type,
