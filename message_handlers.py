@@ -244,7 +244,8 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         if any(phrase in text_lower for phrase in [
             'запомни что я женского пола', 'я женщина', 'я девушка', 'я девочка',
-            'женского пола', 'женщина', 'девушка', 'девочка'
+            'женского пола', 'женщина', 'девушка', 'девочка', 'женский', 'мой пол женский',
+            'пол - женский', 'пол женский'
         ]):
             try:
                 from db_utils import update_user_gender
@@ -256,7 +257,8 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         elif any(phrase in text_lower for phrase in [
             'запомни что я мужского пола', 'я мужчина', 'я парень', 'я мальчик',
-            'мужского пола', 'мужчина', 'парень', 'мальчик'
+            'мужского пола', 'мужчина', 'парень', 'мальчик', 'мужской', 'мой пол мужской',
+            'пол - мужской', 'пол мужской'
         ]):
             try:
                 from db_utils import update_user_gender
