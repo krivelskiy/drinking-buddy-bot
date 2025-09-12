@@ -3,6 +3,7 @@
 """
 import logging
 import asyncio
+import httpx
 from typing import List, Dict, Any
 from database import (
     get_users_for_quick_message, 
@@ -11,6 +12,7 @@ from database import (
     update_last_auto_message
 )
 from llm_utils import generate_quick_message_llm, generate_auto_message_llm
+from config import RENDER_EXTERNAL_URL
 
 logger = logging.getLogger(__name__)
 
@@ -97,12 +99,18 @@ async def auto_message_scheduler(bot):
         await asyncio.sleep(86400)  # Проверяем каждые 24 часа
 
 async def ping_scheduler():
-    """Планировщик пингов для поддержания активности"""
+    """Планировщик пингов для поддержания активности Render"""
+    logger.info("🚀 DEBUG: ping_scheduler() запущен!")
     while True:
         try:
-            # Простой пинг для поддержания активности
-            logger.info("🏓 Ping scheduler running...")
+            # Делаем реальный HTTP-запрос к нашему приложению
+            async with httpx.AsyncClient() as client:
+                response = await client.get(f"{RENDER_EXTERNAL_URL}/ping", timeout=10.0)
+                if response.status_code == 200:
+                    logger.info("🏓 Ping successful - Render kept alive!")
+                else:
+                    logger.warning(f"🏓 Ping failed with status {response.status_code}")
         except Exception as e:
             logger.error(f"Error in ping_scheduler: {e}")
         
-        await asyncio.sleep(60)  # Пинг каждую минуту 
+        await asyncio.sleep(1800)  # Пинг каждые 30 минут (1800 секунд) 
