@@ -24,6 +24,14 @@ def load_system_prompt() -> str:
 
 SYSTEM_PROMPT = load_system_prompt()
 
+# Дополнительные инструкции для LLM о поле
+GENDER_INSTRUCTIONS = """
+ВАЖНО: Обращайся к пользователю в соответствии с его полом:
+- Если пол женский: используй "красавица", "девочка", "девушка", "милая"
+- Если пол мужской: используй "красавчик", "парень", "мальчик", "милый"
+- Всегда учитывай пол при обращении и выборе слов!
+"""
+
 def llm_reply(text_in: str, user_tg_id: int, chat_id: int, recent_messages: List[dict]) -> str:
     """Генерация ответа через LLM"""
     if client is None:
@@ -50,10 +58,15 @@ def llm_reply(text_in: str, user_tg_id: int, chat_id: int, recent_messages: List
         # Добавляем системный промпт
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         
+        # Добавляем инструкции о поле
+        messages.append({"role": "system", "content": GENDER_INSTRUCTIONS})
+        
         # Добавляем информацию о пользователе (БЕЗ ВОЗРАСТА)
         user_info = f"Пользователь: {user_name}"
         if user_gender != "неизвестен":
-            user_info += f", пол: {user_gender}"
+            # Переводим пол на русский язык
+            gender_ru = "женский" if user_gender == "female" else "мужской" if user_gender == "male" else user_gender
+            user_info += f", пол: {gender_ru}"
         if user_preferences:
             user_info += f", любимый напиток: {user_preferences}"
         
