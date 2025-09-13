@@ -20,7 +20,7 @@ def can_katya_drink_free(chat_id: int) -> bool:
             # Проверяем запись с учетом даты сброса
             result = conn.execute(
                 text("""
-                    SELECT drinks_count, last_reset 
+                    SELECT drinks_count, date_reset 
                     FROM katya_free_drinks 
                     WHERE chat_id = :chat_id
                 """),
@@ -28,23 +28,23 @@ def can_katya_drink_free(chat_id: int) -> bool:
             ).fetchone()
             
             if result:
-                drinks_count, last_reset = result
+                drinks_count, date_reset = result
                 
-                # Проверяем, нужно ли сбросить счетчик (прошло больше суток)
+                # ✅ Проверяем, нужно ли сбросить счетчик (прошло больше суток)
                 from datetime import datetime, timezone
                 now = datetime.now(timezone.utc)
                 
-                if last_reset:
-                    # Приводим last_reset к timezone-aware если нужно
-                    if last_reset.tzinfo is None:
-                        last_reset = last_reset.replace(tzinfo=timezone.utc)
+                if date_reset:
+                    # Приводим date_reset к timezone-aware если нужно
+                    if date_reset.tzinfo is None:
+                        date_reset = date_reset.replace(tzinfo=timezone.utc)
                     
                     # Если прошло больше суток, сбрасываем счетчик
-                    if (now - last_reset).days >= 1:
+                    if (now - date_reset).days >= 1:
                         conn.execute(
                             text("""
                                 UPDATE katya_free_drinks 
-                                SET drinks_count = 0, last_reset = NOW() 
+                                SET drinks_count = 0, date_reset = NOW() 
                                 WHERE chat_id = :chat_id
                             """),
                             {"chat_id": chat_id}
@@ -57,7 +57,7 @@ def can_katya_drink_free(chat_id: int) -> bool:
                 # Создаем новую запись
                 conn.execute(
                     text("""
-                        INSERT INTO katya_free_drinks (chat_id, drinks_count, last_reset) 
+                        INSERT INTO katya_free_drinks (chat_id, drinks_count, date_reset) 
                         VALUES (:chat_id, 0, NOW())
                     """),
                     {"chat_id": chat_id}
@@ -75,7 +75,7 @@ def increment_katya_drinks(chat_id: int) -> None:
             # Проверяем, нужно ли сбросить счетчик перед увеличением
             result = conn.execute(
                 text("""
-                    SELECT drinks_count, last_reset 
+                    SELECT drinks_count, date_reset 
                     FROM katya_free_drinks 
                     WHERE chat_id = :chat_id
                 """),
@@ -83,23 +83,23 @@ def increment_katya_drinks(chat_id: int) -> None:
             ).fetchone()
             
             if result:
-                drinks_count, last_reset = result
+                drinks_count, date_reset = result
                 
                 # Проверяем, нужно ли сбросить счетчик (прошло больше суток)
                 from datetime import datetime, timezone
                 now = datetime.now(timezone.utc)
                 
-                if last_reset:
-                    # Приводим last_reset к timezone-aware если нужно
-                    if last_reset.tzinfo is None:
-                        last_reset = last_reset.replace(tzinfo=timezone.utc)
+                if date_reset:
+                    # Приводим date_reset к timezone-aware если нужно
+                    if date_reset.tzinfo is None:
+                        date_reset = date_reset.replace(tzinfo=timezone.utc)
                     
                     # Если прошло больше суток, сбрасываем счетчик
-                    if (now - last_reset).days >= 1:
+                    if (now - date_reset).days >= 1:
                         conn.execute(
                             text("""
                                 UPDATE katya_free_drinks 
-                                SET drinks_count = 1, last_reset = NOW() 
+                                SET drinks_count = 1, date_reset = NOW() 
                                 WHERE chat_id = :chat_id
                             """),
                             {"chat_id": chat_id}
@@ -116,7 +116,7 @@ def increment_katya_drinks(chat_id: int) -> None:
                 # Создаем новую запись
                 conn.execute(
                     text("""
-                        INSERT INTO katya_free_drinks (chat_id, drinks_count, last_reset) 
+                        INSERT INTO katya_free_drinks (chat_id, drinks_count, date_reset) 
                         VALUES (:chat_id, 1, NOW())
                     """),
                     {"chat_id": chat_id}
