@@ -17,55 +17,110 @@ def can_katya_drink_free(chat_id: int) -> bool:
     """Проверить, может ли Катя пить бесплатно"""
     try:
         with engine.begin() as conn:
-            # Сначала проверяем, существует ли таблица и поле
+            # Проверяем запись с учетом даты сброса
             result = conn.execute(
-                text("SELECT drinks_count FROM katya_free_drinks WHERE chat_id = :chat_id"),
+                text("""
+                    SELECT drinks_count, last_reset 
+                    FROM katya_free_drinks 
+                    WHERE chat_id = :chat_id
+                """),
                 {"chat_id": chat_id}
             ).fetchone()
             
             if result:
-                return result[0] < 5  # Максимум 5 бесплатных напитков
+                drinks_count, last_reset = result
+                
+                # Проверяем, нужно ли сбросить счетчик (прошло больше суток)
+                from datetime import datetime, timezone
+                now = datetime.now(timezone.utc)
+                
+                if last_reset:
+                    # Приводим last_reset к timezone-aware если нужно
+                    if last_reset.tzinfo is None:
+                        last_reset = last_reset.replace(tzinfo=timezone.utc)
+                    
+                    # Если прошло больше суток, сбрасываем счетчик
+                    if (now - last_reset).days >= 1:
+                        conn.execute(
+                            text("""
+                                UPDATE katya_free_drinks 
+                                SET drinks_count = 0, last_reset = NOW() 
+                                WHERE chat_id = :chat_id
+                            """),
+                            {"chat_id": chat_id}
+                        )
+                        logger.info(f"Reset drinks count for chat {chat_id} - new day started")
+                        return True  # После сброса можно пить
+                
+                return drinks_count < 5  # Максимум 5 бесплатных напитков
             else:
                 # Создаем новую запись
                 conn.execute(
-                    text("INSERT INTO katya_free_drinks (chat_id, drinks_count) VALUES (:chat_id, 0)"),
+                    text("""
+                        INSERT INTO katya_free_drinks (chat_id, drinks_count, last_reset) 
+                        VALUES (:chat_id, 0, NOW())
+                    """),
                     {"chat_id": chat_id}
                 )
                 return True  # Первый напиток бесплатный
                 
     except Exception as e:
         logger.error(f"Error checking free drinks: {e}")
-        # Если ошибка с полем, пытаемся пересоздать таблицу
-        try:
-            with engine.begin() as conn:
-                conn.execute(text("DROP TABLE IF EXISTS katya_free_drinks"))
-                conn.execute(text("""
-                    CREATE TABLE katya_free_drinks (
-                        id SERIAL PRIMARY KEY,
-                        chat_id BIGINT NOT NULL,
-                        drinks_count INTEGER DEFAULT 0,
-                        last_reset TIMESTAMPTZ DEFAULT NOW(),
-                        created_at TIMESTAMPTZ DEFAULT NOW()
-                    )
-                """))
-                # Создаем запись для пользователя
-                conn.execute(
-                    text("INSERT INTO katya_free_drinks (chat_id, drinks_count) VALUES (:chat_id, 0)"),
-                    {"chat_id": chat_id}
-                )
-                return True
-        except Exception as e2:
-            logger.error(f"Error recreating katya_free_drinks table: {e2}")
-            return True  # По умолчанию разрешаем пить
+        return True  # По умолчанию разрешаем пить
 
 def increment_katya_drinks(chat_id: int) -> None:
     """Увеличить счетчик напитков Кати"""
     try:
         with engine.begin() as conn:
-            conn.execute(
-                text("UPDATE katya_free_drinks SET drinks_count = drinks_count + 1 WHERE chat_id = :chat_id"),
+            # Проверяем, нужно ли сбросить счетчик перед увеличением
+            result = conn.execute(
+                text("""
+                    SELECT drinks_count, last_reset 
+                    FROM katya_free_drinks 
+                    WHERE chat_id = :chat_id
+                """),
                 {"chat_id": chat_id}
-            )
+            ).fetchone()
+            
+            if result:
+                drinks_count, last_reset = result
+                
+                # Проверяем, нужно ли сбросить счетчик (прошло больше суток)
+                from datetime import datetime, timezone
+                now = datetime.now(timezone.utc)
+                
+                if last_reset:
+                    # Приводим last_reset к timezone-aware если нужно
+                    if last_reset.tzinfo is None:
+                        last_reset = last_reset.replace(tzinfo=timezone.utc)
+                    
+                    # Если прошло больше суток, сбрасываем счетчик
+                    if (now - last_reset).days >= 1:
+                        conn.execute(
+                            text("""
+                                UPDATE katya_free_drinks 
+                                SET drinks_count = 1, last_reset = NOW() 
+                                WHERE chat_id = :chat_id
+                            """),
+                            {"chat_id": chat_id}
+                        )
+                        logger.info(f"Reset and incremented drinks count for chat {chat_id} - new day started")
+                        return
+                
+                # Обычное увеличение счетчика
+                conn.execute(
+                    text("UPDATE katya_free_drinks SET drinks_count = drinks_count + 1 WHERE chat_id = :chat_id"),
+                    {"chat_id": chat_id}
+                )
+            else:
+                # Создаем новую запись
+                conn.execute(
+                    text("""
+                        INSERT INTO katya_free_drinks (chat_id, drinks_count, last_reset) 
+                        VALUES (:chat_id, 1, NOW())
+                    """),
+                    {"chat_id": chat_id}
+                )
     except Exception as e:
         logger.error(f"Error incrementing drinks: {e}")
 
