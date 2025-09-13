@@ -194,8 +194,6 @@ def parse_name_from_text(text: str) -> Optional[str]:
         r'как\s+тебя\s+зовут',
         r'какое\s+у\s+тебя\s+имя',
         r'какое\s+у\s+меня\s+имя',
-        r'как\s+тебя\s+зовут',
-        r'как\s+меня\s+зовут',
         r'какого\s+я\s+пола',
         r'какого\s+ты\s+пола',
         r'какой\s+у\s+тебя\s+пол',
@@ -255,10 +253,6 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             # Определяем пол только если имя изменилось И пол не определен
             if current_name != update.message.from_user.first_name and not current_gender:
                 update_user_name_and_gender(user_tg_id, update.message.from_user.first_name)
-            elif current_name != update.message.from_user.first_name:
-                # Если имя изменилось, но пол уже определен, обновляем только имя
-                from db_utils import update_user_name
-                update_user_name(user_tg_id, update.message.from_user.first_name)
         
         # НОВОЕ: Проверяем на упоминание имени в тексте сообщения
         name_from_text = parse_name_from_text(text_in)
