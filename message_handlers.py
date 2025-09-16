@@ -260,10 +260,10 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             if name_from_text:
                 try:
                     from db_utils import update_user_name
-                update_user_name(user_tg_id, name_from_text)
-                logger.info(f"Updated user {user_tg_id} name to {name_from_text}")
-            except Exception as e:
-                logger.error(f"Failed to update name: {e}")
+                    update_user_name(user_tg_id, name_from_text)
+                    logger.info(f"Updated user {user_tg_id} name to {name_from_text}")
+                except Exception as e:
+                    logger.error(f"Failed to update name: {e}")
         
         # Сбрасываем флаг быстрого сообщения при получении сообщения от пользователя
         reset_quick_message_flag(user_tg_id)
