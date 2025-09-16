@@ -203,6 +203,7 @@ def get_users_for_quick_message() -> List[Dict[str, Any]]:
             WHERE m.last_user_message_time IS NOT NULL
                AND m.last_user_message_time < NOW() - INTERVAL '15 minutes'
                AND u.quick_message_sent = FALSE
+               AND (u.last_auto_message IS NULL OR u.last_auto_message < NOW() - INTERVAL '1 hour')
         """
         
         rows = conn.execute(text(query)).fetchall()
@@ -255,13 +256,13 @@ def update_last_auto_message(user_tg_id: int) -> None:
     try:
         with engine.begin() as conn:
             result = conn.execute(
-                text(f"UPDATE {USERS_TABLE} SET last_auto_message = NOW(), quick_message_sent = FALSE WHERE user_tg_id = :tg_id"),
+                text(f"UPDATE {USERS_TABLE} SET last_auto_message = NOW() WHERE user_tg_id = :tg_id"),
                 {"tg_id": user_tg_id}
             )
             updated_count = result.rowcount
-            logger.info(f"Updated last_auto_message and set quick_message_sent=FALSE for user {user_tg_id}, rows affected: {updated_count}")
+            logger.info(f"Updated last_auto_message for user {user_tg_id}, rows affected: {updated_count}")
     except Exception as e:
-        logger.error(f"Error updating last_auto_message for user {user_tg_id}: {e}") 
+        logger.error(f"Error updating last_auto_message for user {user_tg_id}: {e}")
 
 def get_user_preferences(user_tg_id: int) -> Optional[str]:
     """Получить предпочтения пользователя"""
