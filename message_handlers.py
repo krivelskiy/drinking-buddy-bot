@@ -245,13 +245,13 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Сохраняем сообщение пользователя в базу данных
         save_message(chat_id, user_tg_id, "user", text_in)
         
-        # Обновляем имя пользователя из Telegram и определяем пол автоматически
+        # Обновляем имя пользователя из Telegram только если имя еще не установлено
         if update.message.from_user.first_name:
             current_name = get_user_name(user_tg_id)
             current_gender = get_user_gender(user_tg_id)
             
-            # Используем имя из Telegram по умолчанию и определяем пол автоматически
-            if current_name != update.message.from_user.first_name:
+            # Используем имя из Telegram только если имя еще не установлено пользователем
+            if not current_name:
                 update_user_name_and_gender(user_tg_id, update.message.from_user.first_name)
         
         # Проверяем на прямую команду смены имени (только явные команды)
