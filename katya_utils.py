@@ -36,8 +36,13 @@ def can_katya_drink_free(chat_id: int) -> bool:
                 
                 if date_reset:
                     # Приводим date_reset к timezone-aware если нужно
-                    if date_reset.tzinfo is None:
+                    if hasattr(date_reset, 'tzinfo') and date_reset.tzinfo is None:
                         date_reset = date_reset.replace(tzinfo=timezone.utc)
+                    elif not hasattr(date_reset, 'tzinfo'):
+                        # Если это date, конвертируем в datetime
+                        from datetime import date
+                        if isinstance(date_reset, date):
+                            date_reset = datetime.combine(date_reset, datetime.min.time()).replace(tzinfo=timezone.utc)
                     
                     # Если прошло больше суток, сбрасываем счетчик
                     if (now - date_reset).days >= 1:
@@ -91,8 +96,13 @@ def increment_katya_drinks(chat_id: int) -> None:
                 
                 if date_reset:
                     # Приводим date_reset к timezone-aware если нужно
-                    if date_reset.tzinfo is None:
+                    if hasattr(date_reset, 'tzinfo') and date_reset.tzinfo is None:
                         date_reset = date_reset.replace(tzinfo=timezone.utc)
+                    elif not hasattr(date_reset, 'tzinfo'):
+                        # Если это date, конвертируем в datetime
+                        from datetime import date
+                        if isinstance(date_reset, date):
+                            date_reset = datetime.combine(date_reset, datetime.min.time()).replace(tzinfo=timezone.utc)
                     
                     # Если прошло больше суток, сбрасываем счетчик
                     if (now - date_reset).days >= 1:
