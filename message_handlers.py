@@ -225,7 +225,7 @@ def parse_name_from_text(text: str) -> Optional[str]:
         if match:
             name = match.group(1).capitalize()
             # Проверяем, что это не служебные слова
-            if name not in ['я', 'меня', 'зовут', 'имя', 'как', 'что', 'где', 'когда', 'почему', 'зачем', 'пола', 'пол', 'какого', 'какой', 'женского', 'мужского', 'женский', 'мужской']:
+            if name not in ['я', 'меня', 'зовут', 'имя', 'как', 'что', 'где', 'когда', 'почему', 'зачем', 'пола', 'пол', 'какого', 'какой', 'женского', 'мужского', 'женский', 'мужской', 'девушка', 'парень', 'женщина', 'мужчина', 'мальчик', 'девочка']:
                 return name
     
     return None
@@ -245,20 +245,21 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Сохраняем сообщение пользователя в базу данных
         save_message(chat_id, user_tg_id, "user", text_in)
         
-        # Обновляем имя пользователя и определяем пол если оно изменилось
+        # Обновляем имя пользователя из Telegram и определяем пол автоматически
         if update.message.from_user.first_name:
             current_name = get_user_name(user_tg_id)
             current_gender = get_user_gender(user_tg_id)
             
-            # Определяем пол только если имя изменилось И пол не определен
-            if current_name != update.message.from_user.first_name and not current_gender:
+            # Используем имя из Telegram по умолчанию и определяем пол автоматически
+            if current_name != update.message.from_user.first_name:
                 update_user_name_and_gender(user_tg_id, update.message.from_user.first_name)
         
-        # НОВОЕ: Проверяем на упоминание имени в тексте сообщения
-        name_from_text = parse_name_from_text(text_in)
-        if name_from_text:
-            try:
-                from db_utils import update_user_name
+        # Проверяем на прямую команду смены имени (только явные команды)
+        if any(phrase in text_in.lower() for phrase in ['запомни что мое имя', 'запомни мое имя', 'мое имя', 'зовут меня']):
+            name_from_text = parse_name_from_text(text_in)
+            if name_from_text:
+                try:
+                    from db_utils import update_user_name
                 update_user_name(user_tg_id, name_from_text)
                 logger.info(f"Updated user {user_tg_id} name to {name_from_text}")
             except Exception as e:
